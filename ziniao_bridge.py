@@ -47,6 +47,7 @@ TikTok 商家后台的订单/客户接口都必须带**店铺自己的登录态*
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
 import types
@@ -355,10 +356,32 @@ def load_ziniao(root: str | Path | None = None, force: bool = False) -> dict[str
     return _MODS
 
 
+def _seed_config(cfg_path: Path) -> bool:
+    """config.yaml 不存在时，从同目录的 config.example.yaml 播种一份。
+
+    为什么需要：发布用的 zip 里**故意不带 config.yaml**（否则用户解压升级时会把
+    已填好的企业账号盖掉）。全新解压出来的目录只有 config.example.yaml，得有人
+    把它变成真配置文件，否则界面一上来就是「配置缺项」。
+    只读目录等失败情况一律咽掉，让上层用默认值继续跑。
+    """
+    example = cfg_path.with_name("config.example.yaml")
+    try:
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        if example.is_file():
+            shutil.copyfile(example, cfg_path)
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def load_config(root: str | Path | None = None, force: bool = False):
-    """读紫鸟的 config.yaml，返回 ZiniaoConfig。"""
+    """读紫鸟的 config.yaml，返回 ZiniaoConfig（缺失时先播种一份）。"""
     mods = load_ziniao(root, force=force)
-    return mods["client"].ZiniaoConfig.from_yaml(mods["config_path"])
+    cfg_path: Path = mods["config_path"]
+    if not cfg_path.exists():
+        _seed_config(cfg_path)
+    return mods["client"].ZiniaoConfig.from_yaml(cfg_path)
 
 
 def make_client(cfg, log: LogFn | None = None, root: str | Path | None = None):
@@ -370,6 +393,44 @@ def make_client(cfg, log: LogFn | None = None, root: str | Path | None = None):
 def save_config(cfg, root: str | Path | None = None) -> Path:
     mods = load_ziniao(root)
     return cfg.save_yaml(mods["config_path"])
+
+
+def find_client_executable(client_path: str = "", root: str | Path | None = None,
+                           force: bool = False) -> str:
+    """按平台解析（必要时自动探测）紫鸟客户端可执行文件，给界面的「自动检测」用。
+
+    - Windows 没有固定安装目录，``client_path`` 可以是 exe 全路径、所在目录或留空
+    - macOS 支持 ``ziniao`` / ``xxx.app`` / bundle 内的可执行文件
+    ``force=True`` 时忽略上次探测的缓存重新扫一遍（点「自动检测」、或启动环境前用它，
+    因为启动会先杀掉客户端进程，必须在杀之前把路径探到并缓存住）。
+    找不到返回空串。
+    """
+    mods = load_ziniao(root)
+    client_mod = mods["client"]
+    if getattr(client_mod, "IS_WINDOWS", False):
+        return client_mod.resolve_windows_client_executable(client_path, force=force)
+    if getattr(client_mod, "IS_MAC", False):
+        # 解析不出就回落到「ziniao」（去 /Applications 里找）——和 Windows 分支
+        # 一致：配置可能是从别的机器抄来的，写死了别的平台路径不该让整个流程卡死。
+        return (client_mod.resolve_mac_app_executable(client_path)
+                or client_mod.resolve_mac_app_executable("ziniao"))
+    return client_path or "/opt/ziniao/ziniaobrowser"
+
+
+def client_hint(cfg: Any, root: str | Path | None = None) -> str:
+    """找不到客户端时的诊断文本（按平台给具体填法 + 已探过的位置）。
+
+    直接转发给紫鸟客户端的 ``ZiniaoConfig.client_path_hint()``；万一分支没实现
+    或抛错，也给一句兜底，绝不让「提示本身」把界面搞崩。
+    """
+    fn = getattr(cfg, "client_path_hint", None)
+    if callable(fn):
+        try:
+            return str(fn())
+        except Exception as exc:  # pragma: no cover - 只在客户端分支异常时走到
+            return f"生成客户端诊断信息失败：{exc}"
+    return ("没找到紫鸟客户端程序。「客户端路径」留空即可自动查找，"
+            r"Windows 也可直接填 exe 全路径（如 D:\紫鸟\ziniao\ziniao.exe）。")
 
 
 # ----------------------------------------------------------------------------

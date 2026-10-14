@@ -71,6 +71,13 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install "pyinstaller>=6.0"
 
+      # Windows 客户端定位规则的回归测试（在假文件系统上跑，任何平台都能跑）。
+      # 这是唯一能自动拦住「Windows 路径解析又坏了」的地方 —— 真机上没法自动验证。
+      - name: Windows 客户端定位测试
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: python devtools/test_windows_paths.py
+
       # 源码态先自检一次：逻辑问题在这里就暴露，比打包后再查快得多
       - name: 源码自检
         shell: bash
@@ -120,6 +127,17 @@ jobs:
           fi
           if ! grep -q "ziniao_webdriver_demo" check_report.txt; then
             echo "::error::自检报告里没看到紫鸟项目路径，布局不对。"
+            exit 1
+          fi
+          # ★ Windows 客户端解析哨兵 ★
+          # 这一行会真的去跑 Windows 的自动探测链路（环境变量 → 运行中的进程 →
+          # 注册表 winreg → 常见安装目录 → 盘根扫描）。runner 上没装紫鸟，结果
+          # 必然是「未命中」，但只要这行出现了，就说明整条链路在**冻结产物**里
+          # 没崩 —— 它依赖 winreg / ntpath / subprocess，正是最容易漏打进包的东西。
+          if ! grep -q "客户端程序" check_report.txt; then
+            echo "::error::自检报告里没有「客户端程序」这一行 —— Windows 客户端解析链路在"
+            echo "::error::冻结产物里崩了。先检查 build.spec 的 hiddenimports 里有没有"
+            echo "::error:: winreg / ntpath / subprocess。"
             exit 1
           fi
           echo "✔ 冻结产物自检通过"

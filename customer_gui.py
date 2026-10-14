@@ -179,11 +179,21 @@ class EnvThread(QThread):
                 client.kill_process()
             self.log.emit("启动客户端（web_driver + http IPC）…")
             if not client.start_browser():
-                self.done.emit(
-                    False,
-                    "启动环境失败：IPC 端口未就绪。请检查 --user-data-dir / 端口占用 / "
-                    "启动日志（紫鸟项目 logs/ziniao_launch.log）",
-                )
+                if not client.config.client_executable():
+                    # 「找不到程序」和「程序起来了但端口没开」是两回事，别混成一句
+                    # 「端口未就绪」——那会把真正的配置问题盖掉。
+                    self.done.emit(
+                        False,
+                        "启动环境失败：找不到紫鸟客户端程序，请在「编辑配置…」里"
+                        "把「客户端路径」填成 ziniao.exe 的位置（详见上方日志）。",
+                    )
+                else:
+                    self.done.emit(
+                        False,
+                        "启动环境失败：客户端没进入 web_driver 模式（IPC 端口未就绪）。"
+                        "请检查 --user-data-dir / 端口占用 / 启动日志（紫鸟项目 "
+                        "logs/ziniao_launch.log）",
+                    )
                 return
             self.log.emit("更新内核（需要时）…")
             if not client.update_core(on_progress=self.log.emit):
@@ -689,11 +699,12 @@ class PipelineThread(QThread):
 class ZiniaoConfigDialog(QDialog):
     """编辑紫鸟 config.yaml（企业账号 / 客户端路径 / 端口 / 数据目录）。"""
 
-    def __init__(self, cfg: Any, parent=None):
+    def __init__(self, cfg: Any, parent=None, root: str | Path | None = None):
         super().__init__(parent)
         self.setWindowTitle("紫鸟配置")
-        self.resize(620, 340)
+        self.resize(680, 360)
         self.cfg = cfg
+        self.root = root
         layout = QVBoxLayout(self)
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
@@ -703,9 +714,25 @@ class ZiniaoConfigDialog(QDialog):
         self.ed_version.setCurrentText(cfg.version or "v6")
         form.addRow("客户端版本", self.ed_version)
 
+        # 客户端路径 + 自动检测。Windows 上紫鸟的安装目录是安装时自选的，没有
+        # 固定位置，手填很容易填错（真机就出现过把 exe 填进「数据目录」）。
+        client_row = QWidget()
+        crl = QHBoxLayout(client_row)
+        crl.setContentsMargins(0, 0, 0, 0)
+        crl.setSpacing(6)
         self.ed_client = QLineEdit(cfg.client_path or "")
-        self.ed_client.setPlaceholderText("macOS: ziniao 或 /Applications/ziniao.app")
-        form.addRow("客户端路径", self.ed_client)
+        self.ed_client.setPlaceholderText(
+            "留空自动检测；Windows 可填 D:\\紫鸟\\ziniao 或 ……\\ziniao.exe；macOS 填 ziniao")
+        self.ed_client.setToolTip(
+            "紫鸟浏览器**客户端程序**的位置（不是数据目录）。\n"
+            "Windows 没有固定安装路径，填 exe 所在的文件夹也行，留空会自动去找。")
+        self.ed_client.setMinimumWidth(160)
+        crl.addWidget(self.ed_client, 1)
+        self.btn_find_client = QPushButton("自动检测")
+        self.btn_find_client.setToolTip("在常见安装位置、运行中的进程、注册表里找 ziniao.exe")
+        self.btn_find_client.clicked.connect(self._auto_detect_client)
+        crl.addWidget(self.btn_find_client)
+        form.addRow("客户端路径", client_row)
 
         self.sp_port = QSpinBox()
         self.sp_port.setRange(1, 65535)
@@ -714,6 +741,9 @@ class ZiniaoConfigDialog(QDialog):
 
         self.ed_userdata = QLineEdit(cfg.user_data_dir or "")
         self.ed_userdata.setPlaceholderText("留空自动推导（v6 必填项）")
+        self.ed_userdata.setToolTip(
+            "存放 web_driver 实例数据的**文件夹**（不是客户端程序）。\n"
+            "留空即可，会自动建到用户目录下。")
         form.addRow("数据目录", self.ed_userdata)
 
         self.ed_company = QLineEdit(cfg.company or "")
@@ -732,8 +762,43 @@ class ZiniaoConfigDialog(QDialog):
         box.rejected.connect(self.reject)
         layout.addWidget(box)
 
+    def _auto_detect_client(self) -> None:
+        """在常见位置 / 运行中的进程 / 注册表里找出客户端 exe，填进输入框。"""
+        raw = self.ed_client.text().strip()
+        try:
+            found = zb.find_client_executable(raw, root=self.root, force=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "自动检测失败", f"加载紫鸟项目出错：\n{exc}")
+            return
+        if found:
+            self.ed_client.setText(found)
+            QMessageBox.information(self, "已找到客户端", found)
+            return
+        # 找不到：按平台给出「填成什么样」+「已经找过哪些位置」，比一句
+        # 「没找到」有用得多（Windows 上填错的坑特别多）。
+        QMessageBox.information(self, "没找到客户端", zb.client_hint(self.cfg))
+
     def _accept(self) -> None:
         c = self.cfg
+        client = self.ed_client.text().strip()
+        data = self.ed_userdata.text().strip()
+
+        # 最常见的误填：把客户端 exe 填进了「数据目录」（两个框挨着）。拦住并帮它搬过去。
+        if data and (data.lower().endswith(".exe") or Path(data).is_file()):
+            ans = QMessageBox.question(
+                self, "数据目录填错了",
+                "「数据目录」要填一个文件夹，不是客户端程序。\n\n"
+                f"你填的是：\n{data}\n\n"
+                "这看起来是紫鸟客户端的路径 —— 要把它挪到上面的「客户端路径」吗？\n"
+                "（数据目录留空即可，会自动推导）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            if not client:
+                self.ed_client.setText(data)
+            self.ed_userdata.clear()
+
         c.version = self.ed_version.currentText()
         c.client_path = self.ed_client.text().strip()
         c.socket_port = int(self.sp_port.value())
@@ -859,9 +924,17 @@ class MainWindow(QMainWindow):
         self.ed_cfgpath.setMinimumWidth(140)
         grid.addWidget(self.ed_cfgpath, 1, 1, 1, 3)
 
+        # 客户端程序的实际位置。Windows 上没有固定安装目录，常出现「填错框 /
+        # 没填」导致启动失败，这里直接显示解析结果，找不到就红字给填法。
+        grid.addWidget(QLabel("客户端："), 2, 0)
+        self.lbl_client = QLabel("—")
+        self.lbl_client.setWordWrap(True)
+        self.lbl_client.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        grid.addWidget(self.lbl_client, 2, 1, 1, 3)
+
         self.lbl_account = QLabel("账号：—")
         self.lbl_account.setWordWrap(True)
-        grid.addWidget(self.lbl_account, 2, 0, 1, 4)
+        grid.addWidget(self.lbl_account, 3, 0, 1, 4)
 
         bar = QHBoxLayout()
         self.btn_env = QPushButton("启动环境")
@@ -877,11 +950,11 @@ class MainWindow(QMainWindow):
         self.btn_cfg.clicked.connect(self._edit_config)
         bar.addWidget(self.btn_cfg)
         bar.addStretch(1)
-        grid.addLayout(bar, 3, 0, 1, 4)
+        grid.addLayout(bar, 4, 0, 1, 4)
 
         self.chk_kill = QCheckBox("启动前先关闭旧客户端进程")
         self.chk_kill.setChecked(True)
-        grid.addWidget(self.chk_kill, 4, 0, 1, 4)
+        grid.addWidget(self.chk_kill, 5, 0, 1, 4)
 
         grid.setColumnStretch(1, 1)
         return box
@@ -1130,14 +1203,41 @@ class MainWindow(QMainWindow):
             f"　端口：{self.cfg.socket_port}"
             + (f"　[!] 缺：{', '.join(missing)}" if missing else "")
         )
+        self._refresh_client_label()
         if not initial:
             self.log_line(f"已加载紫鸟项目：{root}")
+
+    def _refresh_client_label(self) -> None:
+        """把解析到的客户端 exe 显示在 ① 区，找不到就红字提示怎么填。"""
+        cfg = self.cfg
+        raw = (getattr(cfg, "client_path", "") or "") if cfg else ""
+        try:
+            exe = zb.find_client_executable(raw, root=self.ed_root.text().strip() or None)
+        except Exception as exc:
+            self.lbl_client.setText(f"—（解析失败：{exc}）")
+            self.lbl_client.setStyleSheet("color:#c62828;")
+            return
+        if exe:
+            prefix = "自动找到：" if not raw.strip() else ""
+            self.lbl_client.setText(prefix + exe)
+            self.lbl_client.setToolTip(exe)
+            self.lbl_client.setStyleSheet("")
+            return
+        # 找不到：把平台相关的完整诊断（填法示例 / 已找过的位置）塞进 tooltip，
+        # 界面上只留一行短提示，别把 ① 区撑爆。
+        hint = zb.client_hint(cfg) if cfg is not None else ""
+        self.lbl_client.setText(
+            "没找到客户端程序 —— 点「编辑配置…」→「自动检测」，"
+            "或把「客户端路径」留空（悬停看具体填法）")
+        self.lbl_client.setToolTip(hint or "「客户端路径」留空即可自动查找；Windows 也可直接填 "
+                                          "exe 全路径（如 D:\\紫鸟\\ziniao\\ziniao.exe）")
+        self.lbl_client.setStyleSheet("color:#c62828;")
 
     def _edit_config(self) -> None:
         if self.cfg is None:
             QMessageBox.warning(self, "未加载", "还没找到紫鸟项目，无法编辑配置。")
             return
-        dlg = ZiniaoConfigDialog(self.cfg, self)
+        dlg = ZiniaoConfigDialog(self.cfg, self, root=self.ed_root.text().strip() or None)
         if dlg.exec():
             try:
                 path = zb.save_config(self.cfg, self.ed_root.text().strip() or None)
@@ -1147,6 +1247,25 @@ class MainWindow(QMainWindow):
                 return
             self._load_config()
             self.env_ready = False
+            # 保存完立刻复检一次客户端能不能解析出来 —— 这一栏填错的概率很高
+            # （真机上就有人把 exe 填进了隔壁的「数据目录」），早点说比等启动失败好。
+            self._warn_if_client_unresolved()
+
+    def _warn_if_client_unresolved(self) -> None:
+        """配置刚存完，若仍解析不到客户端就当场提示（不再等到「启动环境」才炸）。"""
+        if self.cfg is None:
+            return
+        root_text = self.ed_root.text().strip() or None
+        try:
+            exe = zb.find_client_executable(self.cfg.client_path, root=root_text, force=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "客户端解析失败", f"解析客户端路径时出错：\n{exc}")
+            return
+        self._refresh_client_label()
+        if exe:
+            self.log_line(f"客户端程序：{exe}")
+            return
+        QMessageBox.warning(self, "还没找到紫鸟客户端", zb.client_hint(self.cfg))
 
     # -- ① 环境 -------------------------------------------------------------
     def _start_env(self) -> None:
@@ -1158,6 +1277,21 @@ class MainWindow(QMainWindow):
         if missing:
             QMessageBox.warning(self, "配置不全", f"config.yaml 缺少：{', '.join(missing)}")
             return
+        # Windows 客户端没有固定安装位置，启动前先强制探一次并缓存：
+        # 之后 Flow 会先杀掉客户端进程，那时再按「运行中的进程」就找不到了。
+        root_text = self.ed_root.text().strip() or None
+        try:
+            exe = zb.find_client_executable(self.cfg.client_path, root=root_text, force=True)
+        except Exception:
+            exe = ""
+        self._refresh_client_label()
+        if not exe:
+            QMessageBox.warning(
+                self, "找不到紫鸟客户端",
+                "没找到紫鸟浏览器的客户端程序，无法启动环境。\n\n"
+                + zb.client_hint(self.cfg))
+            return
+
         self._set_busy("env")
         self.log_line("=" * 60)
         self.worker = EnvThread(self.cfg, self.ed_root.text().strip(),
@@ -1542,6 +1676,15 @@ def main(argv: list[str] | None = None) -> int:
         win = MainWindow()
         win.show()
         app.processEvents()
+        # 客户端解析：这一项在 Windows 上是**最容易出问题**的地方（安装目录
+        # 用户自选、没有固定位置），CI 又在 Windows runner 上跑，所以顺手把它
+        # 也打进报告 —— 既是给用户看的诊断，也是「Windows 分支没崩」的回归哨兵。
+        try:
+            cli = zb.find_client_executable(
+                (getattr(win.cfg, "client_path", "") or "") if win.cfg else "",
+                root=win.ed_root.text().strip() or None, force=True)
+        except Exception as exc:  # noqa: BLE001
+            cli = f"(解析异常：{type(exc).__name__}: {exc})"
         lines = [
             "GUI 构建成功",
             f"冻结打包 : {bool(getattr(sys, 'frozen', False))}",
@@ -1550,6 +1693,7 @@ def main(argv: list[str] | None = None) -> int:
             f"配置文件 : {win.ed_cfgpath.text().strip() or '(未加载)'}",
             f"配置缺项 : {win.cfg.missing() if win.cfg else ['未加载紫鸟配置']}",
             f"装载错误 : {win.cfg_error or '(无)'}",
+            f"客户端程序 : {cli or '(本机没装紫鸟客户端，自动探测已跑完未命中)'}",
             f"订单列   : {len(tc.ORDER_COLUMNS)} ｜客户列: {len(tc.CUSTOMER_COLUMNS)}",
         ]
         if win.cfg is None or win.cfg_error:

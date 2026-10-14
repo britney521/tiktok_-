@@ -205,7 +205,8 @@ python devtools/capture_order_request.py --store 2 --probe-get 订单.xlsx
 
 ## 使用顺序
 
-1. **启动环境**：读紫鸟 `config/config.yaml`（企业账号 / 端口 / `--user-data-dir`），
+1. **启动环境**：定位紫鸟客户端程序（Windows 上自动探测安装位置，见「排错对照」）→
+   读紫鸟 `config/config.yaml`（企业账号 / 端口 / `--user-data-dir`）→
    终止旧进程 → 启动客户端（web_driver + http IPC）→ 更新内核
 2. **获取店铺列表**：表格列按真实返回字段自动推导，支持关键词过滤，双击看原始 JSON
 3. **选中店铺 → 导出订单**：打开订单页 → 点「导出」按钮 → 等生成 → 拦截 URL 取回文件，
@@ -232,6 +233,8 @@ python devtools/capture_order_request.py --store 2 --probe-get 订单.xlsx
 | seller_id | **固定**从店铺 cookie `oec_seller_id_unified_seller_env` 自动取 |
 | 请求间隔 | ④ 抓客户每条之间的等待，**最小 1.5s**（默认 1.5s，防限流） |
 | 跳过 IP 检测 | 默认会等紫鸟的 ip 检测页通过，确认代理生效（失败不中断） |
+| 客户端路径 | ① 区「编辑配置…」里：紫鸟**客户端程序**的位置（不是数据目录）。**留空即可**，会自动探测。Windows 上填 exe 所在**目录**（如 `D:\紫鸟\ziniao`）或全路径都行；macOS 填 `ziniao` |
+| 数据目录 | ① 区「编辑配置…」里：web_driver 实例的数据**文件夹**。留空自动推导。误填成 exe 会被拦下并提示搬走 |
 
 ## 排错对照
 
@@ -252,6 +255,9 @@ python devtools/capture_order_request.py --store 2 --probe-get 订单.xlsx
 | `[code=98001004] 部分信息填写错误` | 参数里的 `seller_id` 与 cookie 里的店铺对不上 | 清空界面上的 seller_id；注意硬改 cookie 里的 seller_id 字段也无效（服务端会拦），必须换真的那份 cookie |
 | 换了正确店铺仍全批 `98001008`，页面内请求也一起被拒 | **页面没停在正确的「区域站」上**：同一个接口路径在 `seller.*`（通用站）回 `98001008`、`seller.eu.*` 回 `No matching route`、**只有 `seller.us.*` 通**（2026-10-14 真机日志）。其次才是 host / 路径前缀（`/na/` 之类） | 已自动兜底：④ 按 **「区域站 × 写法（模板/同源/绝对）」** 逐个试，命中即**锁定「写法 + 该站」组合**，之后每条只发 1 次。要做实可先跑 `python devtools/capture_order_request.py --store N --wait 30` 抓一次真实请求，再正常跑 `customer_gui.py` |
 | 日志里明明有一次 `code=0`，紧接着又全是 `98001008` / `No matching route` | 曾经的实现缺陷（已修）：只记住「写法」没记住「站」，于是下一条跑到 eu 站还用同源路径；换站用的是 `ensure_on`（按站点尾巴比较，各区域站被视为同站 → **从不换站**）；且记录的是**请求地址**而非**页面实际落地的址**（区域站会互相重定向） | 已修：`_ensure_origin` 改用 `navigate` + 按 host 严格复核；每次导航后回读 `location` 取**实测站**；`winner_label` + `winner_origin` 一起锁定 |
+| 启动环境报「找不到紫鸟客户端可执行文件（client_path='ziniao'）」 | Windows 上紫鸟的**安装目录是安装时自选的**，没有固定位置（真机见过 `D:\紫鸟\ziniao`、`C:\Program Files\ZiniaoBrowser` 等）；官方 demo 示例里的 `D:\ziniao\ziniao.exe` 只是其中一种，照抄多半不存在 | **留空即可**，新版会自动找（环境变量 `ZINIAO_EXE_PATH` → 运行中的进程 → 注册表 → 常见安装目录 → 盘根浅扫）。也可手动填 exe 所在**目录**（如 `D:\紫鸟\ziniao`）或全路径，或点配置里的「自动检测」。① 区「客户端」一行会直接显示解析结果，**红字就是没找到**。填错路径不会直接失败，会自动回落到探测。⚠ 如果报错里出现 `client_path='ziniao'`，说明你跑的是**旧版 exe**（旧版没有自动探测、Windows 上恒定失败）—— 换新版即可 |
+| 从快捷方式属性抄下来的路径填进去还是不认 | Windows 资源管理器**默认隐藏已知扩展名**：属性里显示的目标是 `D:\紫鸟\ziniao`，其实那个文件叫 `D:\紫鸟\ziniao.exe`；照抄后 `isfile`/`isdir` 都是假，又不在常见位置表里（例如装在 `E:\soft\ziniao.exe`）→ 自动探测也找不到 | 已修：解析时会自动补一次 `.exe`（`D:\紫鸟\ziniao` → 认到 `D:\紫鸟\ziniao.exe`）。最保险还是抄到 `.exe` 那一位 |
+| 把客户端 exe 填到了「数据目录」 | ① 区配置里「客户端路径」和「数据目录」是挨着的两个框，容易填反 | 保存时会弹窗拦住并**问你搬不搬到「客户端路径」**；就算硬填进去，运行时也会忽略它、回退到默认数据目录（不会崩）。**报错文案里也会点出这个坑** |
 
 ## 目录结构
 
@@ -265,12 +271,13 @@ devtools/export_check.py 真机端到端验证脚本
 devtools/diagnose_store.py 98001008 诊断：页面 / cookie / 订单 三者身份对照
 devtools/capture_order_request.py 抓后台真实订单请求 + 定位发送位置（并产出模板）
 devtools/captured_order_request.json 抓包模板（④ 会自动照抄它）
-devtools/smoke_gui.py   离屏冒烟测试
+devtools/smoke_gui.py   离屏冒烟测试（8 段：构建/布局/流水线/换来源/换写法…）
+devtools/test_windows_paths.py Windows 客户端定位回归测试（假文件系统，任何平台可跑）
 devtools/make_release.py 组装发布目录（exe + 旁挂紫鸟项目），可 --zip
 build.spec              PyInstaller 配置（自动扫描紫鸟客户端的依赖）
 .github/workflows/build.yml  CI：windows-latest 上构建 exe + 冻结产物自检
 vendor/ziniao_webdriver_demo/ 内联的紫鸟协议客户端（只保留真正用到的 2 个 .py）
-    util/ziniao_client.py   ★ 唯一真正干活的（604 行）
+    util/ziniao_client.py   ★ 唯一真正干活的（972 行，含 Windows 客户端定位）
     util/dp.py              被加载但零方法调用（DrissionPage 兼容层，留作后备）
     config/config.example.yaml  账号模板（真配置 config.yaml 已被 .gitignore 挡住）
 docs/screenshots/       界面截图
@@ -308,6 +315,44 @@ docs/screenshots/       界面截图
 顺带确认（对照实验）：`seller_id` / `oec_seller_id` 换成别的店 → `98001004`；**整段删掉** → 照样
 `98001008`；改 `aid`、加 `X-Tts-Oec-Bsid`、换 host → 都不改变结论。**参数不是权限开关**，
 服务端按会话 + 页面站判定。
+
+## 实测结论（2026-10-14，Windows 客户端定位）
+
+Windows 上紫鸟的安装目录是**安装时用户自选**的，没有固定位置。官方 demo 示例里写的
+`D:\ziniao\ziniao.exe` 换台机器多半不存在 —— 照抄就报「找不到紫鸟客户端可执行文件」。
+真机见到的位置就有 `D:\紫鸟\ziniao\ziniao.exe`、`C:\Program Files\ZiniaoBrowser\...` 等。
+
+| 你填的 `client_path` | 行为 |
+|---|---|
+| **留空**（推荐） | 自动探测：环境变量 `ZINIAO_EXE_PATH` → 运行中的进程 → 注册表（卸载信息 / App Paths）→ 常见安装目录 → 各盘根浅扫 `*ziniao*` / `*紫鸟*` |
+| `D:\紫鸟\ziniao`（目录） | 在目录里找 `ziniao.exe`；填再上一层（`D:\紫鸟`）也会往下钻一层 |
+| `D:\紫鸟\ziniao.exe` | 直接用 |
+| `"D:\...\ziniao.exe"` / `d:/紫鸟/...` / 末尾带 `\` | 引号、正斜杠、大小写、尾部分隔符都容忍 |
+| `D:\紫鸟\ziniao`（**隐藏扩展名**，真身是 `ziniao.exe`） | 自动补一次 `.exe` 认到它（见下） |
+| 路径写错 / 换台机器失效 | **不报错**，静默回落到自动探测 |
+
+三个反直觉的点，都是被真机教出来的：
+
+- **刻意不查 PATH**。紫鸟客户端从不往 PATH 里注册，而 `which` 会把任何同名程序当成客户端 ——
+  开发机上就撞到过 `~/.local/bin/ziniao` 这种无关 shim，直接选错文件。
+- **探测结果会缓存，所以时机很关键**。启动流程会先杀掉客户端进程，那时按「运行中的进程」
+  就找不到了。因此「启动环境」是在 kill **之前**强制重探一次（进程还在，路径最准），
+  之后复用该结果。
+- **「省略 .exe」必须单独兜一层**。Windows 资源管理器默认隐藏已知扩展名，用户从快捷方式
+  属性里抄到的是 `D:\紫鸟\ziniao`（看着像目录，实际是 `ziniao.exe`）。只做
+  `isfile` + `isdir` 两步的话，这种写法两个都是假 → 被当成「路径写错」丢给自动探测；
+  而这个目录又不在常见位置表里（比如装在 `E:\soft\ziniao.exe`）→ 自动探测也找不到，
+  最后报「找不到客户端」。所以解析时会额外试一次 `raw + ".exe"`。
+
+**回归测试**：`python devtools/test_windows_paths.py` —— 在假文件系统上把上面每种写法
+（含 `C:\Program Files\...`、中文 exe 名、目录里混着卸载器、E 盘不在位置表里…）跑一遍，
+任何平台都能跑，CI 每次构建都会执行。
+
+**CI 哨兵**：冻结产物自检报告里固定带一行 `客户端程序 : ...`。这一行会真的跑完 Windows
+的自动探测链路（环境变量 → 进程 → `winreg` 注册表 → 目录 → 盘根扫描）—— runner 上没装
+紫鸟，结果必然是「未命中」，但**只要这行出现了，就说明整条链路在冻结产物里没崩**；
+它依赖的 `winreg` / `ntpath` / `subprocess` 恰好是最容易漏打进包的东西（静态分析看不见
+动态加载文件的 import）。缺了这一行，CI 直接判失败。
 
 ## 已知限制
 

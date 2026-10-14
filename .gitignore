@@ -25,6 +25,9 @@ venv/
 build/
 dist/
 *.manifest
+# 本地打好的发布包（几十 MB，CI 会重新产出）
+*.zip
+release/
 # 注意：build.spec 是要提交的，别加 "*.spec"
 
 # --- 导出的订单 / 客户表（含客户姓名、地址、电话等隐私）---
