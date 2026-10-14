@@ -31,6 +31,31 @@ import sys
 import zipfile
 from pathlib import Path
 
+
+def _force_utf8_stdio() -> None:
+    """把 stdout/stderr 切到 UTF-8 输出。
+
+    Windows 的控制台默认编码是 cp1252，而本脚本从头到尾都在 print 中文
+    （发布目录清单、使用说明里的中文路径…），一 print 就是::
+
+        UnicodeEncodeError: 'charmap' codec can't encode characters ...
+
+    实测这种报错会让 CI 的「组装发布目录」步骤直接挂掉。
+    ``errors="replace"`` 是最后兜底：万一某个环境不允许改编码，
+    也只会显示成 ?，不会把构建打断。
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_stdio()
+
 ROOT = Path(__file__).resolve().parent.parent
 VENDOR = ROOT / "vendor" / "ziniao_webdriver_demo"
 

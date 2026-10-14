@@ -25,7 +25,35 @@
 """
 
 import ast
+import sys
 from pathlib import Path
+
+
+def _say(msg: str) -> None:
+    """打一行进度日志；打不出来就咽掉，绝不让它影响构建。
+
+    ★ 为什么要包一层 ★
+    spec 是被 PyInstaller 用 ``exec()`` 执行的 —— 里面任何未捕获异常都会把
+    整个构建带崩。而 Windows 的控制台默认是 cp1252 编码，中文一 print 就是::
+
+        UnicodeEncodeError: 'charmap' codec can't encode characters ...
+
+    实测（GitHub 的 windows runner，2026-10-14）：构建步骤 **1 秒内** 失败，
+    整份日志就只有这一行 traceback，PyInstaller 连依赖分析都没开始 ——
+    为了打一行进度日志而炸掉整条流水线，实在不划算。
+
+    注：workflow 里已经把 PYTHONIOENCODING 设成 utf-8，正常情况下走不到兜底分支；
+    这层是防「有人在本机 Windows 上直接跑 pyinstaller」时再踩同一个坑。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.write(msg + "\n")
+            return
+        except Exception:
+            continue
+
 
 # ---------------------------------------------------------------------------
 # 可调项
@@ -85,7 +113,7 @@ def vendored_imports() -> list[str]:
                 names.add(node.module.split(".")[0])
 
     found = sorted(n for n in names if n not in _SKIP_NAMES)
-    print(f"[build.spec] 从紫鸟客户端扫描到 {len(found)} 个依赖：{found}")
+    _say(f"[build.spec] 从紫鸟客户端扫描到 {len(found)} 个依赖：{found}")
     return found
 
 

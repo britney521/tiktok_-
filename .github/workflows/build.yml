@@ -22,6 +22,16 @@ jobs:
     #   在 macOS/Linux 上跑只会得到对应平台的可执行文件，不是 .exe。
     runs-on: windows-latest
 
+    # ★ 这两个变量不是「优化」，是「不设就必挂」★
+    #   Windows runner 的控制台默认编码是 cp1252，中文一个字都打不出来：
+    #       UnicodeEncodeError: 'charmap' codec can't encode characters ...
+    #   本流程里多个 Python 脚本都要输出中文（build.spec 的依赖清单、
+    #   组装脚本的发布目录清单、exe 自检报告…），实测不设的话
+    #   「构建 exe」这一步会在 1 秒内失败，PyInstaller 连分析都没开始。
+    env:
+      PYTHONUTF8: "1"            # PEP 540：locale / 默认编码全按 UTF-8
+      PYTHONIOENCODING: "utf-8"  # 强制 stdio 用 UTF-8（优先级最高，必须显式写）
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
