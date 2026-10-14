@@ -1,0 +1,45 @@
+# ============================================================
+# tiktok商家 —— 提交之前先看这里
+# ============================================================
+
+# --- 凭据：任何情况下都不要提交 ---
+# 紫鸟企业账号配置（明文账密）。仓库里只保留 config.example.yaml。
+**/ziniao_webdriver_demo/config/config.yaml
+config.yaml
+# 店铺登录态（sid_tt / d_ticket / passport_csrf_token …），抓客户时导出的 cookie 池
+cookies.json
+**/cookies.json
+cookies*.json
+*.cookie
+.env
+*.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- PyInstaller 产物 ---
+build/
+dist/
+*.manifest
+# 注意：build.spec 是要提交的，别加 "*.spec"
+
+# --- 导出的订单 / 客户表（含客户姓名、地址、电话等隐私）---
+*_订单.xlsx
+*_客户.xlsx
+订单.xlsx
+客户.xlsx
+全部 笔订单-*.xlsx
+_导出原始.xlsx
+
+# --- 本机临时文件 ---
+.DS_Store
+staging_file
+_*.json
+
+# --- 本机的 agent 工作记忆 / 会话数据 ---
+# 里面会记录排查过程中的原始日志，可能夹带明文凭据，别跟着仓库走。
+.workbuddy/

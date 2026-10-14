@@ -1,0 +1,32 @@
+ziniao:
+  # 浏览器配置
+  browser:
+    # 浏览器版本 v5 或 v6
+    version: v6
+    # 客户端路径：
+    #   Windows  V6=ziniao.exe 所在路径（如 D:\ziniao\ziniao.exe），V5=starter.exe
+    #   macOS    填应用名 ziniao / /Applications/ziniao.app / 其内层可执行文件均可
+    #   Linux    /opt/ziniao/ziniaobrowser
+    client_path: ziniao
+    # 已改用原生 CDP 接管浏览器，无需 chromedriver，此项保留仅为兼容旧配置
+    webdriver_path: ''
+    # 浏览器 socket 端口，取系统未被占用的端口
+    socket_port: 16851
+    # 【v6 必填】web_driver 实例专用的 user-data-dir。
+    # 不带它时客户端只会把请求转给 GUI 实例，永远不创建 HTTP IPC 端口，
+    # 表现为「启动环境后卡住 / 获取店铺列表失败」。留空则自动推导到
+    #   macOS   ~/Library/Application Support/ziniaobrowser/instances/ziniao_webdriver
+    #   Windows %LOCALAPPDATA%\ziniaobrowser\instances\ziniao_webdriver
+    #   Linux   ~/.config/ziniaobrowser/instances/ziniao_webdriver
+    user_data_dir: ''
+
+  # 企业登录的用户信息 —— 请填你自己的账号，不要提交到仓库
+  user_info:
+    company: ''
+    username: ''
+    password: ''
+
+# 本项目不使用这些任务，保留段位仅为了跟紫鸟原生 config.yaml 兼容
+task:
+  thread_num: 3
+  amazon: []

@@ -1,0 +1,11 @@
+PyQt6>=6.6
+requests>=2.31
+openpyxl>=3.1
+# 原生 CDP 接管店铺浏览器（DrissionPage 在该内核上一导航就掉线，已不再用于本工具）
+websocket-client>=1.7
+
+# 【不要删】紫鸟 util/ziniao_client.py 读写 config/config.yaml 用的。
+# 它在那个文件里是**函数内延迟导入**，而那个文件又是运行时按路径动态加载的，
+# 两重「静态分析看不见」——打包 exe 时如果不显式声明，会漏进包，
+# 打出来的程序一读配置就 ModuleNotFoundError: No module named 'yaml'。
+PyYAML>=6.0

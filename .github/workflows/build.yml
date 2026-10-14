@@ -1,0 +1,130 @@
+name: 构建 Windows exe
+
+# 触发：
+#   · push 到 main/master  → 只出 artifact，不发布
+#   · push tag（v1.0 这类）→ 额外创建 Release 挂上 zip
+#   · 手动 Actions 页面点 Run workflow
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write # 打 tag 时创建 Release 需要
+
+jobs:
+  build:
+    name: Windows exe
+    # ★ 必须是 Windows runner：PyInstaller **不能交叉编译**。
+    #   在 macOS/Linux 上跑只会得到对应平台的可执行文件，不是 .exe。
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 兼容两种仓库布局：
+      #   · 本项目单独一个仓库      → 项目在仓库根
+      #   · 塞在 js_reserve 这类单仓 → 项目在 tiktok商家/ 子目录
+      # 注意：GitHub 只读**仓库根**的 .github/workflows/，
+      #       所以单仓布局时必须把这个文件挪到仓库根再改 working-directory。
+      - name: 定位项目目录
+        id: proj
+        shell: bash
+        run: |
+          if [ -f customer_gui.py ]; then
+            dir="."
+          elif [ -f "tiktok商家/customer_gui.py" ]; then
+            dir="tiktok商家"
+          else
+            echo "::error::仓库里找不到 customer_gui.py，无法构建"
+            exit 1
+          fi
+          echo "项目目录 = $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: "**/requirements.txt"
+
+      - name: 安装依赖
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.0"
+
+      # 源码态先自检一次：逻辑问题在这里就暴露，比打包后再查快得多
+      - name: 源码自检
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python customer_gui.py --check
+
+      - name: 构建 exe
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: python -m PyInstaller build.spec --noconfirm
+
+      - name: 组装发布目录并打包（exe + 旁挂的紫鸟项目）
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: python devtools/make_release.py --zip
+
+      # ★ 这一步是整个流水线的价值所在 ★
+      # 在**真实发布布局**里跑冻结产物的自检，专门抓「PyInstaller 漏依赖」——
+      # 典型就是紫鸟客户端里的 `import yaml`：那个文件是运行时按路径动态加载的，
+      # 里面还是函数内延迟导入，静态分析双重看不见，不进 hiddenimports 必漏。
+      # exe 是窗口程序（console=False），看不到 print，所以让它把报告写成文件。
+      - name: 冻结产物自检（真实发布布局）
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}/release
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set +e
+          "./tiktok商家.exe" --check --check-out check_report.txt
+          echo "退出码 = $?"
+          set -e
+
+          echo "================ 自检报告 ================"
+          cat check_report.txt
+          echo "=========================================="
+
+          if grep -q "未加载紫鸟配置" check_report.txt; then
+            echo "::error::打包漏依赖 —— 冻结后的程序读不到紫鸟配置。"
+            echo "::error::先检查 build.spec 的 hiddenimports 里有没有 yaml。"
+            exit 1
+          fi
+          if grep -q "(未找到)" check_report.txt; then
+            echo "::error::冻结后没找到旁挂的紫鸟项目，检查发布布局。"
+            exit 1
+          fi
+          if ! grep -q "ziniao_webdriver_demo" check_report.txt; then
+            echo "::error::自检报告里没看到紫鸟项目路径，布局不对。"
+            exit 1
+          fi
+          echo "✔ 冻结产物自检通过"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok商家-windows
+          path: ${{ steps.proj.outputs.dir }}/tiktok商家.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 打 tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.proj.outputs.dir }}/tiktok商家.zip
+          generate_release_notes: true
