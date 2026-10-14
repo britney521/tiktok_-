@@ -522,6 +522,19 @@ def main() -> int:
         assert crows[3][16] == "OK", crows[3][16]
         assert FAKE.opened and FAKE.closed, "店铺未正确开关"
 
+        # ★ 抓客户前必须把页面停到**订单页**（2026-10-14 用户真机定案的
+        #   98001008 第一前提：站对、页不对照样报需要权限）★
+        logs = win.log_box.toPlainText()
+        assert "订单页" in logs, "抓客户前没有把页面导航到订单页"
+        # 日志必须写明身份从哪来 —— 否则用户会怀疑「是不是读了本地 cookie 文件」
+        assert "非本地文件" in logs, "日志没写清登录态来源"
+        # 日志必须**同时落盘**：exe 是窗口程序，Windows 用户只能靠这个文件把现场发出来
+        logf = getattr(win, "_log_path", None)
+        assert logf is not None and Path(logf).is_file(), f"日志没落盘：{logf}"
+        assert "已加载紫鸟项目" in Path(logf).read_text(encoding="utf-8",
+                                                   errors="replace"), \
+            "落盘日志与界面日志不一致"
+
         print(f"    导出点击 {FAKE.session.page.export_clicks} 次，"
               f"下载点击 {FAKE.session.page.download_clicks} 次；"
               f"订单 {len(rows)} 行 / 客户 {win.tbl_customers.rowCount()} 行")
@@ -656,6 +669,15 @@ def main() -> int:
         page.redirect = {}
         page.cookie_seller_id = "7494876782645708274"
         print("    恢复桩状态")
+
+    # 冒烟跑出来的运行日志别留在工作区（它含本机路径与账号名；.gitignore 也挡了）
+    try:
+        leftover = getattr(win, "_log_path", None)
+        if leftover and Path(leftover).is_file():
+            Path(leftover).unlink()
+            print("    已清理冒烟产生的运行日志")
+    except Exception:
+        pass
 
     print("\n全部通过")
     return 0

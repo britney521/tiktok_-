@@ -78,6 +78,15 @@ jobs:
         working-directory: ${{ steps.proj.outputs.dir }}
         run: python devtools/test_windows_paths.py
 
+      # 择路逻辑的回归测试（不联网、不碰 Qt，1 秒内跑完）。
+      # 复刻的是「抓客户报 98001008」那条链路：区域站 × 页面路径两个维度。
+      # 真机上跑一遍要几分钟，还没法自动断言 —— 这层是唯一能自动拦住
+      # 「站对页错的 98001008 又回来了」的地方。
+      - name: 择路逻辑测试（区域站 × 订单页）
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: python devtools/test_transport.py
+
       # 源码态先自检一次：逻辑问题在这里就暴露，比打包后再查快得多
       - name: 源码自检
         shell: bash

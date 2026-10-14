@@ -450,6 +450,24 @@ _DISCONNECT_HINTS = ("disconnected", "has been closed", "target closed",
                      "broken pipe", "websocket")
 
 
+# CDP 报的「这个 target / 执行上下文已经没了」。**它不是 JS 自身报错**，而是
+# 连接层事实上的失效：WebSocket 还开着，但那个 target 的调试会话已经换掉了，
+# 于是既拿不到 ``websocket`` 的异常、也不会触发重连 —— 通道会一直失败下去。
+# 真机日志里就是这么卡住的：页面自己从通用站跳去区域站，正好撞上我们下一次
+# ``Runtime.evaluate``，回一个 ``-32000 Inspected target navigated or closed``。
+_CDP_STALE_HINTS: tuple[str, ...] = (
+    "inspected target navigated or closed",
+    "target navigated or closed",
+    "no target with given id",
+    "target closed",
+    "cannot find context with specified id",
+    "cannot find default execution context",
+    "execution context was destroyed",
+    "session with given id not found",
+    "not attached to an active page",
+)
+
+
 def _is_ws_error(exc: BaseException) -> bool:
     """CDP 连接层错误（可重连重试），区别于 JS 自身报错（直接上抛）。"""
     if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionError,
@@ -467,6 +485,12 @@ def _is_ws_error(exc: BaseException) -> bool:
                 return True
     except Exception:
         pass
+    # ★ 「target 已失效」也按连接层处理 ★
+    # 重连会重新发现 page target 并重建 CDP 会话，再重放一次即可
+    # （两个业务接口都是读操作，重放安全）。
+    msg = str(exc).lower()
+    if any(h in msg for h in _CDP_STALE_HINTS):
+        return True
     return is_disconnect(exc)
 
 
@@ -502,6 +526,18 @@ def _same_host(a: str, b: str) -> bool:
 def _is_api_host(url: str) -> bool:
     """是不是接口主机（``api16-*`` / ``api-*``）—— 它不能当页面来源。"""
     return _host_of(url).startswith("api")
+
+
+def _is_page_url(url: str) -> bool:
+    """能不能当「页面来源」用（必须是 http/https 的真实网页）。
+
+    单看 scheme+host 是不够的：紫鸟给的 ``launcherPage`` 有时是它自己的
+    ``chrome-extension://…`` 检测页（``origin_of`` 也会照样解析出一个 origin）。
+    对着这种地址做 ``Page.navigate`` 会把 target 直接弄丢，接着 ``reconnect()``
+    发现「一个 page 都没有」而卡住 —— 必须提前过滤掉。
+    """
+    scheme = urllib.parse.urlsplit(str(url or "")).scheme.lower()
+    return scheme in ("http", "https") and bool(_host_of(url))
 
 
 class BrowserSession:
@@ -719,13 +755,49 @@ class BrowserSession:
                     return str(t.get("url") or "")
             return ""
 
-    def _wait_url(self, url: str, timeout: float = 60.0) -> bool:
+    def _doc_ready(self) -> bool:
+        """页面文档是否加载完（读不到就当没加载完）。"""
+        try:
+            return str(self.eval("document.readyState", await_promise=False,
+                                 timeout=10) or "") == "complete"
+        except Exception:
+            return False
+
+    def _wait_url(self, url: str, timeout: float = 60.0,
+                  settle: int = 2) -> bool:
+        """等页面**真的**停在目标站上。
+
+        ★ 只看一次「同站」是不够的 ★
+        ``_same_site`` 会把各区域站视为同一站（``seller.eu.x.com`` ≈ ``seller.x.com``），
+        而这些站**会互相重定向**（实测：打开 eu 地址，页面最终落在 us）。只比较一次
+        就在重定向链中途认定「到了」，接着用当时猜出来的 origin 去发请求 ——
+
+          · 轻则 ``No matching route`` / ``98001008``（拿错站的身份发）；
+          · 重则撞上 ``Inspected target navigated or closed``（页面还在跳，
+            执行上下文已经被换掉，下一次 ``Runtime.evaluate`` 直接失败）。
+
+        真机上这两条都出现过。所以判定条件收紧成三条：
+        ① 与目标**同站**；② **host 连续 settle 次不变**（重定向跑完了）；
+        ③ ``document.readyState == complete``（读不到就放 settle+2 次机会，
+        别把慢页面卡死）。
+        """
         deadline = time.time() + max(1.0, float(timeout))
+        last_host = ""
+        stable = 0
+        polls = 0
         while time.time() < deadline:
+            polls += 1
             cur = self.current_url()
             if cur.startswith("http") and _same_site(cur, url):
-                return True
-            time.sleep(1)
+                host = _host_of(cur)
+                stable = stable + 1 if host == last_host else 1
+                last_host = host
+                if stable > settle and (self._doc_ready() or polls >= settle + 2):
+                    return True
+            else:
+                stable = 0
+                last_host = ""
+            time.sleep(0.8)
         return False
 
     def navigate(self, url: str, retry: int = 5, interval: float = 2.0,
@@ -1318,6 +1390,12 @@ class BrowserTransport:
     ``(写法, 页面实际 origin)`` 一起记（``winner_label`` / ``winner_origin``）；
     换站必须走 ``navigate`` 而不是 ``ensure_on``（后者把各区域站视作同站，不换）。
 
+    ★ 候选**顺序**同样是关键（2026-10-14 真机：嘉恒业 618 条整批 98001008）★
+    流水线 ③「导出订单」会把页面开在**这家店自己的区域站**上（导出就是那个站
+    成功的），随后 ④ 抓客户时这里如果仍按固定列表从通用站试起，第一件事就是
+    **把页面从对的站导航到错的站**。所以 ``_order()`` 先问一次浏览器「你现在
+    在哪」，把它排在最前面 —— 大多数情况一次请求就直接命中，不导航、不扫站。
+
     调用约定与 tiktok_client 的 transport 一致：``fn(url, params, body) -> dict``。
     """
 
@@ -1325,10 +1403,17 @@ class BrowserTransport:
                  origins: Iterable[str] | None = None,
                  blocked_codes: Iterable[Any] = ("10000",),
                  use_page_origin: bool = True,
-                 template: dict[str, Any] | None = None):
+                 template: dict[str, Any] | None = None,
+                 page_path: str = ""):
         self._browser = browser
         self.log = log or _noop
         self.origins = [str(o).rstrip("/") for o in (origins or []) if o]
+        # ★ 页面必须停在哪个路径上（例：订单页 ``/order?selected_sort=6&tab=all``）★
+        # 2026-10-14 用户真机定案：**光换区域站还不够** —— 同源 fetch 要求页面本身
+        # 就停在订单页上。站对了但页面在首页/工作台，一样拿 98001008。所以换站时
+        # 不能只导航到 origin 根，要直接导航到「该站的订单页」；已经在目标站但不在
+        # 订单页时，也要补一次导航。
+        self.page_path = str(page_path or "")
         self.blocked_codes = {str(c) for c in blocked_codes}
         self.calls = 0
         # 实测教训：后台自己发的是**同源** ``seller.<region>.../api/...``，
@@ -1352,6 +1437,8 @@ class BrowserTransport:
         self.winner_origin: str = ""
         # 「来源 × 写法」全扫过一遍仍没打通 → 之后单发
         self.swept = False
+        # 上次记进日志的「页面当前站」（只记一次，别 618 条订单刷 618 行）
+        self._first_logged = ""
         # 这些码说明「这次请求发得不对」—— 换写法再试（页面来源换过了就换 host）
         self.retry_codes = {str(c) for c in blocked_codes} | PERMISSION_CODES
 
@@ -1364,55 +1451,121 @@ class BrowserTransport:
 
     # -- 候选顺序 -----------------------------------------------------------
     def _order(self) -> list[str | None]:
-        """候选页面来源：**已打通的站 → 当前站 → 其余**（接口主机不能当页面）。"""
-        cands = [o for o in self.origins if not _is_api_host(o)]
-        first = self.winner_origin or self.page_origin
-        if not first or _is_api_host(first):
+        """候选页面来源：**页面当前所在站 → 已打通的站 → 其余候选**。
+
+        ★ 必须真的问一次浏览器「你现在在哪」★
+        ``page_origin`` 初始是空的，只有导航过才会被写入。照原样排，第一条就会拿
+        ``origins[0]``（内置列表的首项 = 通用站）去发 —— 而流水线里 ③「导出订单」
+        早就把页面开在了**这家店自己的区域站**上（导出就是在那个站成功的）。
+        于是我们做的第一件事是**把页面从对的站导航到错的站**，接着整批 98001008、
+        还要再一站一站试回来。真机日志（2026-10-14，嘉恒业 618 条）就是这个顺序：
+        通用站先 → 98001008 → 换 eu → …
+
+        现在改成先取**实测**的当前站，且不要求它在候选表里（店铺可能落在我们
+        没列出的区域站上，例：``seller.uk.…``）；非 http 的页面（紫鸟的
+        ``chrome-extension://`` 检测页）直接不用。
+        """
+        cands = [o for o in self.origins if _is_page_url(o) and not _is_api_host(o)]
+        first = self.winner_origin or self.page_origin or self._ask_page_origin()
+        if not _is_page_url(first) or _is_api_host(first):
             first = ""
-        rest = [o for o in cands if o != first]
-        return (([first] if first else []) + rest) or [None]
+        if first and first != getattr(self, "_first_logged", ""):
+            self._first_logged = first
+            self.log(f"页面当前在 {first}，先按这个站发"
+                     "（区域站不对会自动换，命中后锁定）")
+        out = ([first] if first else []) + [o for o in cands if o != first]
+        return out or [None]
 
     def _ask_page_origin(self) -> str:
-        """问浏览器：工作页面**现在**在哪个 origin。"""
+        """问浏览器：工作页面**现在**在哪个 origin（非 http 的当作没有）。"""
         try:
             cur = self._browser.current_url()
         except Exception:
             cur = ""
-        return origin_of(cur)
+        return origin_of(cur) if _is_page_url(cur) else ""
+
+    # -- 页面路径约束 -------------------------------------------------------
+    def _on_wanted_page(self) -> bool:
+        """页面（连路径一起看）是不是已经停在我们要求的那个页面上。
+
+        没配 ``page_path`` 时永远算「是」—— 只约束到站、不约束到页。
+        """
+        if not self.page_path:
+            return True
+        try:
+            cur = str(self._browser.current_url() or "")
+        except Exception:
+            return True          # 读不到就别折腾，让后面如实报错
+        if not _is_page_url(cur):
+            return False
+        want = [s for s in urllib.parse.urlsplit(self.page_path).path.split("/") if s]
+        got = [s for s in urllib.parse.urlsplit(cur).path.split("/") if s]
+        return True if not want else got[:len(want)] == want
+
+    def _goto(self, url: str) -> None:
+        """换页（用 ``navigate``；``ensure_on`` 见 ``_ensure_origin`` 的第 1 条）。"""
+        nav = getattr(self._browser, "navigate", None)
+        if callable(nav):
+            nav(url)
+            return
+        fn = getattr(self._browser, "ensure_on", None)
+        if callable(fn):
+            fn(url)
+
+    def _target_url(self, origin: str) -> str:
+        """在某个站上我们要真正打开的那个地址（带 ``page_path``）。"""
+        base = str(origin).rstrip("/")
+        return base + self.page_path if self.page_path else base
 
     def _ensure_origin(self, origin: str | None) -> bool:
-        """把工作页面切到指定 origin，返回「现在确实在这个站」。
+        """把工作页面切到指定 origin 并停在要求的页面上，返回「到位了」。
 
-        两个必须踩过的坑：
+        三个必须踩过的坑：
 
         1. **不能用 ``ensure_on``** —— 它按站点尾巴比较，会把
            ``seller.us.x.com`` / ``seller.eu.x.com`` / ``seller.x.com`` 当成同站，
            于是**从不真正换站**（页面停在通用站，我们却以为切过去了）。
            这里用 ``navigate``，并且按 host 严格复核。
-        2. ``api16-*`` 是接口主机，不是页面 —— 拿它当页面来源只会拿到一堆
-           JS 报错，直接跳过。
+        2. ``api16-*`` 是接口主机、``chrome-extension://`` 是紫鸟自己的检测页，
+           都不是页面 —— 拿它们当页面来源只会把 target 弄丢，直接跳过。
+        3. ★ **站对还不够，页面也得对** ★（2026-10-14 用户真机定案）
+           同源 fetch 要求页面**本身**就停在订单页上；站选对了但页面在首页/
+           工作台，一样是 ``98001008 需要权限``。所以换站时直接导航到
+           「该站的订单页」，已经在目标站但不在订单页时补一次导航。
         """
-        if origin and _is_api_host(origin):
+        if origin and (_is_api_host(origin) or not _is_page_url(origin)):
             return False
         if origin is None:                      # 没有候选站：就在当前页面试
+            if self.page_path and self.page_origin and not self._on_wanted_page():
+                self.log(f"页面当前不在 {self.page_path}，先导航过去")
+                self._goto(self._target_url(self.page_origin))
+                self.page_origin = self._ask_page_origin() or self.page_origin
+                self._po_cache = ""
             return True
         cur = self.page_origin or self._ask_page_origin()
         if origin and cur and _same_host(cur, origin):
             self.page_origin = cur          # 已经在目标站，别多跳（导航会掉线）
             self._po_cache = ""
+            if not self._on_wanted_page():
+                # ★ 站对、页不对 = 照样 98001008（真机定案）★ 补一次导航
+                self.log(f"页面在 {cur}，但没停在 {self.page_path}，补一次导航")
+                self._goto(self._target_url(origin))
+                self.page_origin = self._ask_page_origin() or cur
+                self._po_cache = ""
             return True
         if origin:
-            nav = getattr(self._browser, "navigate", None)
-            if callable(nav):
-                nav(origin)
-            else:
-                fn = getattr(self._browser, "ensure_on", None)
-                if callable(fn):
-                    fn(origin)
+            self._goto(self._target_url(origin))
             # 关键：记**实际**落地的站，服务端可能重定向（eu 地址 → us 页面）
             self.page_origin = self._ask_page_origin() or self.page_origin
             self._po_cache = ""
-            return bool(self.page_origin and _same_host(self.page_origin, origin))
+            hit = bool(self.page_origin and _same_host(self.page_origin, origin))
+            if not hit:
+                # 落不到请求的那个站也要**照实记下来**：这条日志是「为什么这批
+                # 订单报 98001008」的第一现场 —— 区域站会互相重定向，真正
+                # 可用的是**落地**的那个站，不是我们请求的那个。
+                self.log(f"页面来源 {origin} → 实际落在 "
+                         f"{self.page_origin or '(读不到)'}")
+            return hit
         return bool(cur)
 
     # -- 目标 URL：同源 / 照抄模板 ------------------------------------------
@@ -1687,7 +1840,8 @@ class TransportChain:
             last_payload = payload if isinstance(payload, dict) else None
             if (nxt and code is not None and self.fallthrough
                     and str(code) in self.fallthrough):
-                self.log(f"通道「{name}」返回 code={code}（疑似风控/限流），改用「{nxt}」")
+                self.log(f"通道「{name}」返回 code={code}（这个通道拿不到数据），"
+                         f"改用「{nxt}」")
                 continue
 
             self.used = name

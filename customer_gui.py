@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -75,6 +77,27 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ORDER_OUT = BASE_DIR / "订单.xlsx"
 DEFAULT_CUSTOMER_OUT = BASE_DIR / "客户.xlsx"
 DEFAULT_INPUT = BASE_DIR / "全部 笔订单-2026-10-13-06_43.xlsx"
+
+
+def reveal_path(path: Any) -> None:
+    """用系统默认的方式打开文件 / 文件夹（跨平台）。
+
+    原来是硬编码 ``subprocess.Popen(["open", p])`` —— 那是 **macOS 专属**命令，
+    在 Windows 上直接抛 ``FileNotFoundError``（找不到 open 这个程序），
+    而「打开输出目录」「打开日志文件」恰恰是 Windows 用户最常用的两个按钮。
+    """
+    p = str(path)
+    if not p:
+        return
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(p)  # type: ignore[attr-defined]  # 仅 Windows 有
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", p])
+        else:
+            subprocess.Popen(["xdg-open", p])
+    except Exception:
+        pass
 
 
 def _safe_filename(name: Any) -> str:
@@ -247,6 +270,10 @@ class PipelineThread(QThread):
         self.store = dict(store)
         self.opts = dict(opts)
         self.stop_event = threading.Event()
+        # ③ 导出订单成功时页面所在的站（= 这家店自己的区域站）。
+        # 只用于排查与日志：④ 抓客户时通道会先问浏览器「现在在哪」，
+        # 那条路等同于此，但万一页面漂了，日志里有这个对照值。
+        self.export_origin = ""
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -326,6 +353,11 @@ class PipelineThread(QThread):
             # 那是另一个店铺的 id（实测踩过）。界面上手填的优先。
             seller = typed or ctx.get("seller_id") or ""
             if cookies:
+                # 明确写清身份从哪来 —— 这条链路**不读任何本地 cookie 文件**，
+                # 用的是紫鸟店铺浏览器里那份实时登录态（CDP Network.getCookies，
+                # 且按店铺后台域名精确取）。换台电脑跑同一个 exe 也能用，
+                # 前提是那台机器上的店铺浏览器登录的是同一家店。
+                self.log.emit("身份来源：紫鸟店铺浏览器实时登录态（非本地文件、非内置默认值）")
                 self.log.emit(f"从店铺浏览器取到 {len(cookies)} 条 cookie，"
                               f"店铺 seller_id={seller or '(未取到)'}"
                               f"{f'（{zb.store_name_of(seller)}）' if zb.store_name_of(seller) else ''}"
@@ -406,12 +438,16 @@ class PipelineThread(QThread):
         """候选页面来源：界面上手填的 → 店铺后台首页 → 内置候选 → 接口 origin。
 
         fetch 必须从其中一个 origin 发起，否则跨域预检失败（Failed to fetch）。
+
+        只收 http/https：紫鸟给的 ``launcherPage`` 有时是它自己的
+        ``chrome-extension://…`` 检测页，拿它当页面来源做 ``Page.navigate``
+        会把 target 直接弄丢（之后连不上，报一堆 JS 错误）。
         """
         out: list[str] = []
         for cand in [o.get("page_origins") or "", home, *zb.TIKTOK_PAGE_ORIGINS]:
             for part in str(cand).replace(";", ",").split(","):
                 origin = zb.origin_of(part.strip())
-                if origin and origin not in out:
+                if origin and zb._is_page_url(origin) and origin not in out:
                     out.append(origin)
         api_origin = zb.origin_of(o.get("api_base") or "")
         if api_origin and api_origin not in out:
@@ -428,15 +464,23 @@ class PipelineThread(QThread):
             if tmpl and tmpl.get("url"):
                 self.log.emit(f"检测到抓包模板：{tmpl['url'][:110]}")
                 self.log.emit("  → 浏览器内请求将照抄它的 host / 路径前缀 / 查询参数")
+            # page_path：同源 fetch **必须**从订单页发起（真机定案）。
+            # 换区域站时会直接打开「该站的订单页」，而不是只到站点根。
             items.append(("浏览器内", zb.BrowserTransport(
-                browser, log=self.log.emit, origins=origins, template=tmpl)))
+                browser, log=self.log.emit, origins=origins, template=tmpl,
+                page_path=te.ORDER_PAGE_SUFFIX)))
         if mode in ("auto", "direct"):
             items.append(("本地直连", zb.RequestsTransport(
                 cookies, dict(tc.DEFAULT_HEADERS), log=self.log.emit)))
         if not items:
             raise zb.ZiniaoBridgeError("没有可用的请求通道（浏览器连接与 cookie 均不可用）")
-        # order/list 本地直连恒定 code=10000；把它当「换个通道试试」的信号
-        return zb.TransportChain(items, log=self.log.emit, fallthrough_codes=("10000",))
+        # 「换个通道试试」的信号，只在真有下一个通道时才启用（单通道等于不启用）：
+        #   · 10000         —— order/list 本地直连恒定返回它（风控/限流）
+        #   · 98001008 等    —— 浏览器内那条路可能只是**页面站/页**选得不对。
+        #                      而 ``order/get``（客户信息）本地直连实测可用，
+        #                      让它有机会兜住，不至于因为一个站选错就整批中止。
+        codes = ["10000"] + (list(zb.PERMISSION_CODES) if len(items) > 1 else [])
+        return zb.TransportChain(items, log=self.log.emit, fallthrough_codes=tuple(codes))
 
     # -- 订单 ---------------------------------------------------------------
     def _export_orders(self, browser: Any) -> list[dict[str, str]]:
@@ -471,6 +515,16 @@ class PipelineThread(QThread):
         te.write_rows(header, rows, out)
         self.log.emit(f"共 {len(rows)} 条订单，已写入：{out}（{len(header)} 列）")
         self.order_progress.emit(len(rows), len(rows))
+
+        # 记下**导出成功时页面所在的站**。这是这家店自己的区域站（导出就是在它上面
+        # 点出来的），④ 抓客户会优先按这个站发；不写这一行，之后 98001008 就没法
+        # 一眼看出「当时页面到底停在哪个站」（2026-10-14 真机排查全靠它）。
+        try:
+            self.export_origin = exporter.host()
+        except Exception:
+            self.export_origin = ""
+        if self.export_origin:
+            self.log.emit(f"导出用的站：{self.export_origin}")
 
         # 顺手把「页面自己用的 seller_id」取回来 —— 这是唯一可信的店铺身份，
         # ④ 用它来核对 cookie 推导出来的值（cookie 可能多店铺串味）。
@@ -537,6 +591,60 @@ class PipelineThread(QThread):
                       f"（{zb.store_name_of(sid) or '未登记'}）")
         return probe
 
+    def _ensure_order_page(self, browser: Any) -> str:
+        """把工作页面停到**订单页**上，返回实际落地的 origin（读不到就给空串）。
+
+        ★ 这是抓客户能不能通的**第一前提**（2026-10-14 用户真机定案）★
+        同源 fetch 只在订单页上成立：``<站>/order?selected_sort=6&tab=all``。
+        注意它和「换区域站」是**两层**问题，都要满足：
+
+          · 站错、页对 → 98001008（拿错站的身份发）
+          · 站对、页错 → 照样 98001008（页面自己的会话上下文不在订单页上）
+
+        优先用**导出订单时那个站**（``export_origin``）—— 导出就是在它上面成功的；
+        没有就退回当前站，再没有就用内置首页。
+        """
+        base = (self.export_origin or "").rstrip("/")
+        if not base:
+            try:
+                base = zb.origin_of(str(browser.current_url() or ""))
+            except Exception:
+                base = ""
+        if not base:
+            base = zb.TIKTOK_SELLER_HOME.rstrip("/")
+        # 已经在「本站的订单页」上就别再导航 —— 导航会掉线，而且订单页首屏的
+        # 那几秒等待也没必要（③ 导出刚走过一遍）。
+        page_root = te.ORDER_PAGE_SUFFIX.split("?")[0]      # "/order"
+        try:
+            cur = str(browser.current_url() or "")
+        except Exception:
+            cur = ""
+        already = (bool(cur) and cur.startswith("http")
+                   and page_root in cur and zb.origin_of(cur) == base)
+        if already:
+            self.log.emit(f"页面已在订单页：{cur[:120]}")
+            return zb.origin_of(cur)
+        url = base + te.ORDER_PAGE_SUFFIX
+        ok = False
+        try:
+            browser.navigate(url, retry=3, interval=2.0, wait=45)
+            ok = True
+        except Exception as exc:
+            self.log.emit(f"导航到订单页失败（继续尝试接口）：{exc}")
+        if ok:
+            time.sleep(te.PAGE_SETTLE)      # 等订单页首屏请求跑完
+        try:
+            cur = str(browser.current_url() or "")
+        except Exception:
+            cur = ""
+        landed = zb.origin_of(cur) if cur.startswith("http") else ""
+        if cur:
+            self.log.emit(f"页面已停在：{cur[:120]}")
+        if landed and base and landed != base:
+            self.log.emit(f"[注意] 请求的是 {base}，实际落在 {landed}"
+                          "（区域站会互相重定向，抓客户按落地站发）")
+        return landed
+
     def _fetch_customers(self, browser: Any, client_obj: tc.OrderClient,
                          rows: list[dict[str, str]],
                          origins: list[str] | None = None) -> dict[str, Any]:
@@ -549,6 +657,12 @@ class PipelineThread(QThread):
 
         self.log.emit(f"===== 抓取客户信息：{len(ids)} 条，间隔 {interval}s =====")
         self.customer_progress.emit(0, len(ids))
+
+        # ★ 抓客户前必须把页面停回**订单页** ★
+        # 2026-10-14 用户真机定案：同源 fetch 只在订单页上成立 —— 站选对了但页面
+        # 停在首页/工作台，一样是 98001008「需要权限」。③ 导出本来就在订单页上，
+        # 但下载与面板操作都可能把页面带偏，所以这里显式回一次。
+        self._ensure_order_page(browser)
 
         # ---- 店铺身份预检：先拿前 3 条试水，别等跑完几百条才发现全错 ----
         try:
@@ -1124,6 +1238,7 @@ class MainWindow(QMainWindow):
         dock.setWidget(self.log_box)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
         self.resizeDocks([dock], [220], Qt.Orientation.Vertical)
+        self._start_log_file()
 
     def _build_menu(self) -> None:
         m = self.menuBar().addMenu("工具")
@@ -1139,6 +1254,12 @@ class MainWindow(QMainWindow):
         act_open = QAction("打开输出目录", self)
         act_open.triggered.connect(self._open_output_dir)
         m.addAction(act_open)
+        act_log = QAction("打开日志文件", self)
+        act_log.triggered.connect(self._open_log_file)
+        m.addAction(act_log)
+        act_log_save = QAction("日志另存为…", self)
+        act_log_save.triggered.connect(self._save_log_as)
+        m.addAction(act_log_save)
         act_check = QAction("环境自检", self)
         act_check.triggered.connect(self._self_check)
         m.addAction(act_check)
@@ -1152,10 +1273,84 @@ class MainWindow(QMainWindow):
         else:
             self.log_bus.message.emit(str(msg))
 
+    def _pick_log_path(self) -> Path | None:
+        """日志文件放哪：优先程序（exe）旁边，不可写就退到用户主目录。"""
+        for base in (zb.app_dir(), Path.home()):
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+                probe = base / ".__log_probe"
+                probe.write_text("", encoding="utf-8")
+                probe.unlink()
+                return base / "运行日志.txt"
+            except Exception:
+                continue
+        return None
+
+    def _start_log_file(self) -> None:
+        """把日志**同时**写一份到文件。
+
+        为什么必须落盘：exe 是窗口程序，日志只在界面里（而且只留最近 4000 行）。
+        真机出问题时用户往往只能截图，而「页面停在哪个区域站」「每种写法各返回
+        什么 code」这些关键行一屏根本截不全 —— 2026-10-14 排查 98001008 就卡在
+        这里。现在每次运行都写「运行日志.txt」，出问题一键把整份现场发出来即可。
+
+        只在交互运行时写：``--check`` 是打包后跑的自检，没人看日志，写了只会
+        在发布目录里留一个**含账号名与本机路径**的文件（差点误提交，见 .gitignore）。
+        """
+        if "--check" in sys.argv:
+            self._log_path = None
+            self._log_handle = None
+            return
+        self._log_path = self._pick_log_path()
+        self._log_handle = None
+        if self._log_path is None:
+            return
+        try:
+            with open(self._log_path, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write("===== tiktok商家 运行日志 =====\n")
+                fh.write(f"时间     : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                fh.write(f"平台     : {sys.platform}\n")
+                fh.write(f"Python   : {sys.version.split()[0]}\n")
+                fh.write(f"冻结打包 : {bool(getattr(sys, 'frozen', False))}\n")
+                fh.write(f"程序目录 : {zb.app_dir()}\n\n")
+            self._log_handle = open(self._log_path, "a", encoding="utf-8",
+                                    errors="replace")
+        except Exception:
+            self._log_handle = None
+        if self._log_handle is not None:
+            self.log_line(f"日志文件：{self._log_path}")
+            self.log_line("（出问题时「工具 → 打开日志文件」，把整份发来即可）")
+
+    def _open_log_file(self) -> None:
+        p = getattr(self, "_log_path", None)
+        if not p:
+            QMessageBox.information(self, "日志", "这份运行没能创建日志文件。")
+            return
+        reveal_path(p)
+
+    def _save_log_as(self) -> None:
+        out, _ = QFileDialog.getSaveFileName(
+            self, "日志另存为", str(self._log_path or (Path.home() / "运行日志.txt")),
+            "文本文件 (*.txt)")
+        if not out:
+            return
+        try:
+            Path(out).write_text(self.log_box.toPlainText(), encoding="utf-8")
+            self.log_line(f"日志已另存为：{out}")
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", f"写入失败：\n{exc}")
+
     def _append_log(self, msg: str) -> None:
         if not hasattr(self, "log_box"):
             return
         self.log_box.appendPlainText(str(msg))
+        fh = getattr(self, "_log_handle", None)
+        if fh is not None:
+            try:
+                fh.write(str(msg) + "\n")
+                fh.flush()          # 崩溃/强杀时也别丢最后几行
+            except Exception:
+                self._log_handle = None
 
     # -- 状态 ---------------------------------------------------------------
     def _set_busy(self, state: str) -> None:
@@ -1632,14 +1827,12 @@ class MainWindow(QMainWindow):
 
     # -- 其它 ---------------------------------------------------------------
     def _open_output_dir(self) -> None:
-        import subprocess
-
         for text in (self.ed_cust_out.text().strip(), self.ed_order_out.text().strip()):
             p = Path(text)
             if p.parent.exists():
-                subprocess.Popen(["open", str(p.parent)])
+                reveal_path(p.parent)
                 return
-        subprocess.Popen(["open", str(BASE_DIR)])
+        reveal_path(BASE_DIR)
 
     def _self_check(self) -> None:
         lines = [
@@ -1663,6 +1856,14 @@ class MainWindow(QMainWindow):
             if hasattr(self.worker, "stop"):
                 self.worker.stop()
             self.worker.wait(5000)
+        # 关掉日志句柄：Windows 上文件被占用时用户连删都删不掉
+        fh = getattr(self, "_log_handle", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            self._log_handle = None
         event.accept()
 
 
