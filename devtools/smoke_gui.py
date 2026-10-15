@@ -458,6 +458,13 @@ def main() -> int:
     print(f"    账号: {win.lbl_account.text()}")
     print(f"    ③导出选项: 范围={cg.DEFAULT_EXPORT_SCOPE}｜格式={cg.DEFAULT_EXPORT_FORMAT}"
           "（界面已固定走默认，无对应控件）")
+    # 「有界面」的两个默认值 —— 都是踩过坑才定下来的，别被改回去：
+    #   · 显示店铺浏览器窗口 默认开（isHeadless=0，能亲眼看到页面停在订单页）
+    #   · 强制重启客户端     默认关（客户端已在跑就复用，不关掉用户自己打开的那个）
+    assert win.chk_visible.isChecked(), "「显示店铺浏览器窗口」必须默认勾选"
+    assert not win.chk_kill.isChecked(), "「强制重启客户端」必须默认不勾选"
+    print(f"    ①区默认值: 显示店铺窗口={win.chk_visible.isChecked()}"
+          f"｜强制重启={win.chk_kill.isChecked()}")
 
     print("[2] 布局溢出检查")
     print("    无溢出" if check_layout(win) else "    布局存在问题")

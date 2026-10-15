@@ -197,27 +197,50 @@ class EnvThread(QThread):
             self.done.emit(False, f"加载紫鸟项目失败：{exc}")
             return
         try:
-            if self.kill_first:
-                self.log.emit("终止旧的紫鸟客户端进程…")
-                client.kill_process()
-            self.log.emit("启动客户端（web_driver + http IPC）…")
-            if not client.start_browser():
-                if not client.config.client_executable():
-                    # 「找不到程序」和「程序起来了但端口没开」是两回事，别混成一句
-                    # 「端口未就绪」——那会把真正的配置问题盖掉。
-                    self.done.emit(
-                        False,
-                        "启动环境失败：找不到紫鸟客户端程序，请在「编辑配置…」里"
-                        "把「客户端路径」填成 ziniao.exe 的位置（详见上方日志）。",
-                    )
-                else:
-                    self.done.emit(
-                        False,
-                        "启动环境失败：客户端没进入 web_driver 模式（IPC 端口未就绪）。"
-                        "请检查 --user-data-dir / 端口占用 / 启动日志（紫鸟项目 "
-                        "logs/ziniao_launch.log）",
-                    )
-                return
+            # ★ 客户端已经在跑就直接复用，别再 kill 一遍 ★
+            # 紫鸟的 ``--run_type=web_driver`` 语义就是「让超级浏览器以无界面状态运行
+            # 主进程」——这是官方设计，去掉该参数就没有 HTTP IPC 端口。所以只要这里
+            # 无脑 kill 再 start，就成了「启动后没有界面」。复用能少一次无谓的重启。
+            reused = False
+            try:
+                reused = bool(client.port_open())
+            except Exception:
+                reused = False
+            if reused:
+                self.log.emit(
+                    f"检测到紫鸟客户端已在运行（IPC 端口 "
+                    f"{getattr(client, 'socket_port', '') or '(未知)'} 已就绪），"
+                    "直接复用，不再重启。")
+                self.log.emit(
+                    "  说明：web_driver 模式下紫鸟**主程序**本来就没有窗口（官方设计）；\n"
+                    "  你看到的店铺页面在**店铺浏览器窗口**里，那个是真实 Chromium\n"
+                    "  窗口、默认可见（受「显示店铺浏览器窗口」控制）。")
+            else:
+                if self.kill_first:
+                    self.log.emit("终止旧的紫鸟客户端进程…")
+                    self.log.emit(
+                        "  注意：紫鸟**进程唯一**，GUI 模式实例占着位置时自动化实例\n"
+                        "  起不来，所以这里必须关掉它；而自动化模式是无界面的，\n"
+                        "  被关掉的那个窗口不会被换回来（店铺浏览器窗口不受影响）。")
+                    client.kill_process()
+                self.log.emit("启动客户端（web_driver + http IPC）…")
+                if not client.start_browser():
+                    if not client.config.client_executable():
+                        # 「找不到程序」和「程序起来了但端口没开」是两回事，别混成一句
+                        # 「端口未就绪」——那会把真正的配置问题盖掉。
+                        self.done.emit(
+                            False,
+                            "启动环境失败：找不到紫鸟客户端程序，请在「编辑配置…」里"
+                            "把「客户端路径」填成 ziniao.exe 的位置（详见上方日志）。",
+                        )
+                    else:
+                        self.done.emit(
+                            False,
+                            "启动环境失败：客户端没进入 web_driver 模式（IPC 端口未就绪）。"
+                            "请检查 --user-data-dir / 端口占用 / 启动日志（紫鸟项目 "
+                            "logs/ziniao_launch.log）",
+                        )
+                    return
             self.log.emit("更新内核（需要时）…")
             if not client.update_core(on_progress=self.log.emit):
                 self.done.emit(False, "更新内核失败，请升级紫鸟客户端")
@@ -295,7 +318,10 @@ class PipelineThread(QThread):
             self.stage.emit("打开店铺")
             label = zb.store_label(self.store)
             self.log.emit(f"===== 打开店铺：{label} =====")
-            ret = client.open_store(self.store)
+            headless = int(o.get("headless", 0) or 0)
+            self.log.emit(f"打开店铺（isHeadless={headless}"
+                          f"{'，可见' if not headless else '，后台无头'}）…")
+            ret = client.open_store(self.store, is_headless=headless)
             store_key = (ret.get("browserOauth") or ret.get("browserId")
                          or zb.browser_key(self.store))
             port = ret.get("debuggingPort")
@@ -307,6 +333,14 @@ class PipelineThread(QThread):
             browser = zb.open_session(port, log=self.log.emit, home_urls=origins)
             summary["browser_port"] = port
             summary["origins"] = origins
+
+            if not headless:
+                # 窗口可能最小化/被盖住 —— 拉回前台，让「页面是否停在订单页」肉眼可查
+                try:
+                    if browser.bring_to_front():
+                        self.log.emit("店铺浏览器窗口已置前")
+                except Exception as exc:
+                    self.log.emit(f"（窗口置前失败，不影响运行：{type(exc).__name__}）")
 
             # IP 检测：确认店铺代理已生效（可在界面上跳过；失败不中断）
             ip_url = ret.get("ipDetectionPage")
@@ -1066,9 +1100,24 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         grid.addLayout(bar, 4, 0, 1, 4)
 
-        self.chk_kill = QCheckBox("启动前先关闭旧客户端进程")
-        self.chk_kill.setChecked(True)
+        # 默认**不**勾选：客户端已在运行就直接复用，不再把它关掉重启。
+        # 紫鸟在自动化（web_driver）模式下本来就没有主界面，重启只会让界面消失。
+        self.chk_kill = QCheckBox("强制重启客户端（会关掉已有的紫鸟实例）")
+        self.chk_kill.setChecked(False)
+        self.chk_kill.setToolTip(
+            "默认不勾选：检测到客户端已在运行就直接复用。\n"
+            "勾选后：先杀掉所有紫鸟进程、再以后台方式重启。\n"
+            "只有「端口被占死 / 复用后店铺打不开」时才需要勾。")
         grid.addWidget(self.chk_kill, 5, 0, 1, 4)
+
+        # 店铺浏览器窗口是否可见 —— 这才是能看见 TikTok 后台的那个窗口
+        self.chk_visible = QCheckBox("显示店铺浏览器窗口（取消则后台无头运行）")
+        self.chk_visible.setChecked(True)
+        self.chk_visible.setToolTip(
+            "打开店铺时 isHeadless=0：弹出真实 Chromium 窗口，\n"
+            "能直接看到页面停在订单页，排查问题时很有用。\n"
+            "取消勾选 = isHeadless=1，纯后台跑，快一点但看不见。")
+        grid.addWidget(self.chk_visible, 6, 0, 1, 4)
 
         grid.setColumnStretch(1, 1)
         return box
@@ -1722,6 +1771,8 @@ class MainWindow(QMainWindow):
             "seller_id": "",
             "transport_mode": DEFAULT_TRANSPORT_MODE,
             "skip_ip_check": self.chk_skip_ip.isChecked(),
+            # 店铺浏览器窗口是否可见（0=可见，1=无头）
+            "headless": 0 if self.chk_visible.isChecked() else 1,
         }
 
         self._set_busy("pipe")

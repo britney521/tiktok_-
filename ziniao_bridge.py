@@ -696,6 +696,35 @@ class BrowserSession:
         except Exception:
             return False
 
+    def bring_to_front(self) -> bool:
+        """把店铺浏览器窗口还原并置前（最小化了/被别的窗口盖住时尤其有用）。
+
+        背景：紫鸟的 **客户端主程序** 在 ``--run_type=web_driver`` 下必然无界面
+        （官方语义就是「让超级浏览器以无界面状态运行主进程」），这个改不了 ——
+        去掉该参数就没有 HTTP IPC 端口。但**店铺浏览器窗口是真实的 Chromium
+        窗口**，只要 ``isHeadless=0`` 就会弹出来，看的到 TikTok 后台页面。
+        这里只负责把它从「最小化 / 被遮挡」状态拉回前台。
+        两层都失败也不抛异常（老内核未必支持 ``Browser.*`` 域）。
+        """
+        ok = False
+        try:
+            self.call("Page.bringToFront", {}, timeout=5, retry=False)
+            ok = True
+        except Exception as exc:
+            self.log(f"Page.bringToFront 失败：{type(exc).__name__}: {exc}")
+        try:
+            win = self.call("Browser.getWindowForTarget",
+                            {"targetId": self._target_id}, timeout=5, retry=False)
+            wid = (win or {}).get("windowId")
+            if wid is not None:
+                self.call("Browser.setWindowBounds",
+                          {"windowId": wid, "bounds": {"windowState": "normal"}},
+                          timeout=5, retry=False)
+                ok = True
+        except Exception as exc:
+            self.log(f"窗口还原不可用（{type(exc).__name__}），只做了置前")
+        return ok
+
     # -- CDP 调用 ----------------------------------------------------------
     def call(self, method: str, params: dict[str, Any] | None = None,
              timeout: float | None = None, retry: bool = True) -> Any:
