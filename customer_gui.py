@@ -34,7 +34,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QFont
@@ -69,6 +69,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import captcha_solver as cs
 import tiktok_client as tc
 import tiktok_export as te
 import ziniao_bridge as zb
@@ -76,6 +77,8 @@ import ziniao_bridge as zb
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ORDER_OUT = BASE_DIR / "订单.xlsx"
 DEFAULT_CUSTOMER_OUT = BASE_DIR / "客户.xlsx"
+DEFAULT_RATING_OUT = BASE_DIR / "商品评分.xlsx"
+DEFAULT_BAD_CUSTOMER_OUT = BASE_DIR / "客户差评信息.xlsx"
 DEFAULT_INPUT = BASE_DIR / "全部 笔订单-2026-10-13-06_43.xlsx"
 
 
@@ -108,8 +111,9 @@ def _safe_filename(name: Any) -> str:
     return text.strip(" .")[:60]
 
 
-def store_output_paths(store: dict[str, Any] | None) -> tuple[Path, Path]:
-    """按店铺名生成默认输出路径：``<店铺名>_订单.xlsx`` / ``<店铺名>_客户.xlsx``。
+def store_output_paths(store: dict[str, Any] | None
+                       ) -> tuple[Path, Path, Path, Path]:
+    """按店铺名生成默认输出路径：``<店铺名>_订单/客户/商品评分/客户差评信息.xlsx``。
 
     以前所有店铺都写同一个「订单.xlsx」「客户.xlsx」，导完一个店再导另一个就
     互相覆盖了。带上店铺名后一个店一份文件，也方便按店名找。
@@ -117,10 +121,14 @@ def store_output_paths(store: dict[str, Any] | None) -> tuple[Path, Path]:
     """
     name = _safe_filename((store or {}).get("browserName") or "")
     if not name:
-        return DEFAULT_ORDER_OUT, DEFAULT_CUSTOMER_OUT
+        return (DEFAULT_ORDER_OUT, DEFAULT_CUSTOMER_OUT, DEFAULT_RATING_OUT,
+                DEFAULT_BAD_CUSTOMER_OUT)
     return (
         DEFAULT_ORDER_OUT.with_name(f"{name}_订单{DEFAULT_ORDER_OUT.suffix}"),
         DEFAULT_CUSTOMER_OUT.with_name(f"{name}_客户{DEFAULT_CUSTOMER_OUT.suffix}"),
+        DEFAULT_RATING_OUT.with_name(f"{name}_商品评分{DEFAULT_RATING_OUT.suffix}"),
+        DEFAULT_BAD_CUSTOMER_OUT.with_name(
+            f"{name}_客户差评信息{DEFAULT_BAD_CUSTOMER_OUT.suffix}"),
     )
 
 # 订单表格最多渲染多少行（导出文件可能几千行 × 63 列，全塞进 QTableWidget 很卡）
@@ -134,6 +142,12 @@ DEFAULT_TRANSPORT_MODE = "auto"
 
 # 抓客户的最小请求间隔（秒）。太密容易被平台风控，界面上不允许调到比这更小。
 MIN_CUSTOMER_INTERVAL = 1.5
+
+# 后台店铺默认目标（账号下挂了多个店铺时用；按显示名/区域码解析成 shop_region 导航）
+DEFAULT_TARGET_SHOP = "United States"
+
+# ⑥ 差评客户表的列 = 客户列 + 差评自带的两列（评分、商品）
+BAD_CUSTOMER_COLUMNS: list[str] = list(tc.CUSTOMER_COLUMNS) + ["评分", "商品"]
 
 # 店铺列表优先展示的字段（名称取自紫鸟 v6 getBrowserList 的真实返回）
 PREFERRED_FIELDS: list[tuple[str, str]] = [
@@ -157,6 +171,61 @@ def _cell(value: Any) -> str:
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def dir_of(path: Any) -> Path:
+    """取一个路径**所在的目录**（它本身就是目录就用它自己），不可用则退回项目目录。
+
+    「浏览…」只让用户选目录，所以起始位置得从「框里那个文件的全路径」推出来；
+    框里可能是空的、不存在的、或者只剩个文件名 —— 都不能让对话框崩，一律兜底。
+    """
+    text = str(path or "").strip()
+    if not text:
+        return BASE_DIR
+    p = Path(text)
+    d = p if p.is_dir() else p.parent
+    return d if d.is_dir() else (d.parent if d.parent.is_dir() else BASE_DIR)
+
+
+# ----------------------------------------------------------------------------
+# 评分文件（⑤ 的产物）—— ⑥ 的依赖判断要用（MainWindow 的检查 + PipelineThread 的读取）
+# ----------------------------------------------------------------------------
+
+def rating_file_candidates(rating_out: Path) -> list[Path]:
+    """评分文件的候选路径（按优先级，去重）：筛过的 out → 完整版 ``_评分原始``。
+
+    真机⑤导出的完整版其实是 **CSV**（平台给的就是 CSV），所以 ``.csv`` 和
+    ``.xlsx`` 两种后缀都认 —— 只看 ``.xlsx`` 会在「只有 CSV 完整版」时误报
+    「找不到评分表」。
+    """
+    out = Path(rating_out)
+    cands = [out,
+             out.with_name(f"_评分原始{out.suffix or '.xlsx'}"),
+             out.with_name("_评分原始.csv"),
+             out.with_name("_评分原始.xlsx")]
+    seen: set[str] = set()
+    return [p for p in cands if not (str(p) in seen or seen.add(str(p)))]
+
+
+def rating_order_column(rating_out: Path) -> str:
+    """读评分文件表头，返回认出的「订单号」列名（认不出/读不到返回空串）。
+
+    ⑥ 的依赖判断要用它：评分文件**自带 order_id** 时压根不需要订单表，那时不该
+    再拿「找不到订单表」拦人（真机⑤导出的 CSV 就有 order_id）。认不出才退回
+    「昵称 → 订单表」那条老路。
+
+    只看**第一个存在的文件**：那正是 ⑥ 实际会读的那一份，多看了反而误导。
+    """
+    for p in rating_file_candidates(rating_out):
+        if not p.exists():
+            continue
+        try:
+            header, rows = te.parse_rating(p)
+        except Exception:
+            continue
+        if rows:
+            return te.pick_column(header, te.RATING_ORDER_COLUMNS) or ""
+    return ""
 
 
 # ----------------------------------------------------------------------------
@@ -198,9 +267,8 @@ class EnvThread(QThread):
             return
         try:
             # ★ 客户端已经在跑就直接复用，别再 kill 一遍 ★
-            # 紫鸟的 ``--run_type=web_driver`` 语义就是「让超级浏览器以无界面状态运行
-            # 主进程」——这是官方设计，去掉该参数就没有 HTTP IPC 端口。所以只要这里
-            # 无脑 kill 再 start，就成了「启动后没有界面」。复用能少一次无谓的重启。
+            # 紫鸟**进程唯一**：GUI 实例占着位置时自动化实例起不来，所以只有端口
+            # 被占死时才需要真的 kill。复用能少一次无谓的重启（也不打断已有会话）。
             reused = False
             try:
                 reused = bool(client.port_open())
@@ -211,17 +279,9 @@ class EnvThread(QThread):
                     f"检测到紫鸟客户端已在运行（IPC 端口 "
                     f"{getattr(client, 'socket_port', '') or '(未知)'} 已就绪），"
                     "直接复用，不再重启。")
-                self.log.emit(
-                    "  说明：web_driver 模式下紫鸟**主程序**本来就没有窗口（官方设计）；\n"
-                    "  你看到的店铺页面在**店铺浏览器窗口**里，那个是真实 Chromium\n"
-                    "  窗口、默认可见（受「显示店铺浏览器窗口」控制）。")
             else:
                 if self.kill_first:
                     self.log.emit("终止旧的紫鸟客户端进程…")
-                    self.log.emit(
-                        "  注意：紫鸟**进程唯一**，GUI 模式实例占着位置时自动化实例\n"
-                        "  起不来，所以这里必须关掉它；而自动化模式是无界面的，\n"
-                        "  被关掉的那个窗口不会被换回来（店铺浏览器窗口不受影响）。")
                     client.kill_process()
                 self.log.emit("启动客户端（web_driver + http IPC）…")
                 if not client.start_browser():
@@ -280,8 +340,12 @@ class PipelineThread(QThread):
     stage = pyqtSignal(str)                    # 当前阶段名
     order_progress = pyqtSignal(int, int)      # 已拉取订单, 总数(0=未知)
     customer_progress = pyqtSignal(int, int)   # 已完成, 总数
+    rating_progress = pyqtSignal(int, int)     # 已导出, 总数
+    bad_progress = pyqtSignal(int, int)        # 差评客户已完成, 总数
     orders_ready = pyqtSignal(object)          # list[dict] 订单行
     customer_row = pyqtSignal(int, object)     # 行号, 客户信息
+    rating_ready = pyqtSignal(object)          # list[dict] 商品评分行
+    bad_ready = pyqtSignal(object)             # list[dict] 客户差评行
     done = pyqtSignal(dict)                    # 汇总
     failed = pyqtSignal(str)
 
@@ -297,6 +361,16 @@ class PipelineThread(QThread):
         # 只用于排查与日志：④ 抓客户时通道会先问浏览器「现在在哪」，
         # 那条路等同于此，但万一页面漂了，日志里有这个对照值。
         self.export_origin = ""
+        # ⑤→⑥ 之间的交接：评分表头 / 用到的列名 / 筛出的 1~3 星行
+        self._rating_header: list[str] = []
+        self._rating_cols: dict[str, str] = {"score": "", "buyer": "", "product": ""}
+        self._rating_bad: list[dict[str, Any]] = []
+        self._rating_all: list[dict[str, Any]] = []
+        self._bad_hit = False
+        # ④ 抓过的客户行缓存 {Order ID: 行} —— ⑥ 直接复用，同一单不重复请求
+        self._cust_cache: dict[str, dict[str, str]] = {}
+        # ④ 建好的 SKU ID 兜底表 {Order ID: SKU ID}（⑥ 直接用，不重读订单表）
+        self._sku_map_cache: dict[str, str] = {}
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -306,7 +380,9 @@ class PipelineThread(QThread):
         o = self.opts
         summary: dict[str, Any] = {
             "order_count": 0, "order_out": "", "customer_count": 0,
-            "customer_out": "", "errors": 0, "stopped": False,
+            "customer_out": "", "rating_count": 0, "rating_out": "",
+            "bad_count": 0, "bad_out": "",
+            "errors": 0, "stopped": False,
         }
         client = None
         browser = None
@@ -318,10 +394,8 @@ class PipelineThread(QThread):
             self.stage.emit("打开店铺")
             label = zb.store_label(self.store)
             self.log.emit(f"===== 打开店铺：{label} =====")
-            headless = int(o.get("headless", 0) or 0)
-            self.log.emit(f"打开店铺（isHeadless={headless}"
-                          f"{'，可见' if not headless else '，后台无头'}）…")
-            ret = client.open_store(self.store, is_headless=headless)
+            self.log.emit("打开店铺…")
+            ret = client.open_store(self.store)
             store_key = (ret.get("browserOauth") or ret.get("browserId")
                          or zb.browser_key(self.store))
             port = ret.get("debuggingPort")
@@ -334,14 +408,6 @@ class PipelineThread(QThread):
             summary["browser_port"] = port
             summary["origins"] = origins
 
-            if not headless:
-                # 窗口可能最小化/被盖住 —— 拉回前台，让「页面是否停在订单页」肉眼可查
-                try:
-                    if browser.bring_to_front():
-                        self.log.emit("店铺浏览器窗口已置前")
-                except Exception as exc:
-                    self.log.emit(f"（窗口置前失败，不影响运行：{type(exc).__name__}）")
-
             # IP 检测：确认店铺代理已生效（可在界面上跳过；失败不中断）
             ip_url = ret.get("ipDetectionPage")
             if o.get("skip_ip_check"):
@@ -351,6 +417,19 @@ class PipelineThread(QThread):
                 zb.check_ip(browser, ip_url, log=self.log.emit)
 
             # ---- 打开店铺后台，建立会话 ----
+            # 账号下挂了多个店铺时（如秋图2：Spain / United States），**直接导航到
+            # 目标店铺的后台首页** —— URL 里的 shop_region 决定是哪家店，一步到位：
+            #   https://seller.<区域>.tiktokshopglobalselling.com/homepage?shop_region=XX
+            # 不模拟点击右上角切换器（要开菜单、等渲染、还可能挡住导出按钮）。
+            # 切错店铺 → cookie 里 seller_id 是另一家的 → 后面整批 98001008，所以
+            # home / origins 必须跟着换：cookie 是**按域名精确取**的
+            # （seller.us.* ≠ seller.eu.*），站不对就拿不到这家店的身份。
+            target_shop = (o.get("target_shop") or "").strip()
+            shop_url = te.shop_home_url(target_shop) if target_shop else ""
+            if shop_url:
+                home = shop_url
+                origins = self._origins(home, o)
+                summary["origins"] = origins
             self.stage.emit("打开店铺后台")
             self.log.emit(f"打开店铺后台：{home}")
             try:
@@ -358,6 +437,19 @@ class PipelineThread(QThread):
                 self.log.emit(f"当前页面：{browser.current_url()[:120]}")
             except Exception as exc:
                 self.log.emit(f"打开后台页面失败（继续尝试接口）：{exc}")
+
+            # ---- 确认确实停在目标店铺（已在 = 幂等不动；认不出的店铺名只告警）----
+            if target_shop:
+                self.stage.emit("确认后台店铺")
+                shop = te.ensure_shop(browser, target_shop, log=self.log.emit)
+                new_home = str(shop.get("url") or "").strip()
+                if new_home:
+                    home = new_home
+                    origins = self._origins(home, o)
+                    summary["origins"] = origins
+                if not shop.get("ok"):
+                    self.log.emit("[警告] 没能确认已切到目标后台店铺，继续用当前页面跑；"
+                                  "若下面报 98001008，先看上面的落地 URL 停在哪个店")
 
             # 取 cookie 必须**按店铺域名精确取**（store_context → Network.getCookies）。
             # Storage.getCookies 会把整个 profile 的 cookie 全给我们：统一商家环境下
@@ -452,6 +544,36 @@ class PipelineThread(QThread):
                 summary["customer_count"] = got.get("ok", 0)
                 summary["errors"] += got.get("fail", 0)
                 summary["customer_out"] = got.get("out", "")
+
+            # ---- ⑤ 导出商品评分 ----
+            # 放在最后：它会把页面导航到 /product/rating，而 ④ 抓客户依赖页面停在
+            # 订单页。反过来就每次都要靠 _ensure_order_page 救一次，白白多一次导航。
+            if o.get("do_rating") and not self.stop_event.is_set():
+                rrows = self._export_ratings(browser)
+                summary["rating_count"] = len(rrows)
+                summary["rating_out"] = str(o.get("rating_out") or "")
+                self.rating_ready.emit(rrows)
+
+            # ---- ⑥ 差评客户 ----
+            # 可以**单独跑**：⑤ 没跑就直接读「评分 Excel」框里那个文件（⑤ 已经筛
+            # 过的是幂等的，没筛过的就地筛一遍再覆盖保存）。
+            # 评分文件**自带订单号**（真机导出的 CSV 就有 order_id 列）→ 直接用它
+            # 去 order/get，不碰订单表。只有老版「仅昵称」的文件才拿昵称回订单表
+            # 换 Order ID（可能因脱敏 K***** 匹配不上）。跟在 ④ 后面时复用缓存，
+            # 不重复发请求。
+            if o.get("do_bad") and not self.stop_event.is_set():
+                if not o.get("do_rating"):
+                    self._load_rating_bad()
+                if self._bad_hit:
+                    got = self._fetch_bad_customers(browser, client_obj,
+                                                    self._rating_bad,
+                                                    origins, rows)
+                    summary["bad_count"] = got.get("ok", 0)
+                    summary["errors"] += got.get("fail", 0)
+                    summary["bad_out"] = got.get("out", "")
+                    self.bad_ready.emit(got.get("rows") or [])
+                else:
+                    self.log.emit("没有 1~3 星的评价 → ⑥ 不抓差评客户")
 
             summary["stopped"] = self.stop_event.is_set()
             self.done.emit(summary)
@@ -575,6 +697,115 @@ class PipelineThread(QThread):
             self.log.emit(f"读页面店铺身份失败（忽略，继续）：{exc}")
         return [dict(zip(header, r)) for r in rows]
 
+    def _export_ratings(self, browser: Any) -> list[dict[str, str]]:
+        """⑤ 走商品评分页自己的「导出」按钮导出并下载。
+
+        和订单是两条独立的路：评分页没有「导出范围 / 格式」面板，只有一颗按钮；
+        点完可能立刻下载、也可能进导出历史异步生成 —— 两种都在
+        ``te.RatingExporter`` 里实现了。
+        """
+        o = self.opts
+        self.stage.emit("导出商品评分")
+        self.log.emit("===== 后台「商品评分」导出 =====")
+        exporter = te.RatingExporter(browser, log=self.log.emit)
+        # 用③导出订单成功时那个站（= 这家店自己的区域站），别退回通用站
+        exporter.base = self.export_origin or ""
+        out = Path(o.get("rating_out") or DEFAULT_RATING_OUT)
+        raw_out = out.with_name(f"_评分原始{out.suffix or '.xlsx'}")
+        self.rating_progress.emit(0, 0)
+
+        result = exporter.export(
+            out_path=raw_out,
+            timeout=float(o.get("export_timeout") or 300),
+            poll=float(o.get("export_poll") or 6),
+            retries=int(o.get("retries") or 3),
+        )
+        header: list[str] = result["header"]
+        rows: list[list[Any]] = result["rows"]
+        if not rows:
+            self.log.emit("⚠ 商品评分导出文件里没有数据行")
+            return []
+
+        return self._apply_rating_filter(header, rows, out)
+
+    def _apply_rating_filter(self, header: list[str], rows: list[list[Any]],
+                             out: Path) -> list[dict[str, str]]:
+        """⑤ 和 ⑥ 共用：筛出 1~3 星 → **覆盖保存**到 ``out`` → 记进 self。
+
+        完整版由调用方各自另存（⑤ 存 ``_评分原始.xlsx``；单独跑⑥时若完整版
+        已存在就别动它，免得把完整版盖成筛过的）。
+        没筛到差评时**保留完整表**：宁可多存一份数据，也绝不往用户的文件里
+        写一个空表。
+        """
+        score_col, bad_rows, _scores = te.filter_low_ratings(header, rows)
+        self._rating_header = list(header)
+        self._rating_cols = {
+            "score": score_col,
+            "buyer": te.pick_column(header, te.RATING_BUYER_COLUMNS),
+            "product": te.pick_column(header, te.RATING_PRODUCT_COLUMNS),
+            # ★ 真机 CSV 评分文件自带 order_id（2026-10-15 实测）→ 有它就直接用，
+            #   不必拿昵称回订单表反查（老版「只有昵称」的文件才需要那条路）。
+            "order": te.pick_column(header, te.RATING_ORDER_COLUMNS),
+        }
+        if not score_col:
+            self.log.emit(f"⚠ 没认出评分列（文件列：{'，'.join(header[:8])}…），"
+                          "本轮不筛选，评分表保留完整内容")
+        hits = bool(bad_rows)
+        if hits:
+            te.write_rows(header, bad_rows, out, sheet="商品评分")
+            self.log.emit(f"1~3 星 {len(bad_rows)}/{len(rows)} 条，"
+                          f"已覆盖保存：{out}（{len(header)} 列）")
+        else:
+            te.write_rows(header, rows, out, sheet="商品评分")
+            self.log.emit(f"共 {len(rows)} 条商品评分（其中没有 1~3 星），"
+                          f"已写入：{out}（{len(header)} 列）")
+        self._bad_hit = hits
+        self._rating_bad = [dict(zip(header, r)) for r in bad_rows]
+        self._rating_all = [dict(zip(header, r)) for r in rows]
+        self.rating_progress.emit(len(bad_rows) if hits else len(rows),
+                                  len(bad_rows) if hits else len(rows))
+        return self._rating_bad if hits else self._rating_all
+
+    def _load_rating_bad(self) -> bool:
+        """单独跑 ⑥ 时的评分来源：直接读 ⑤ 已经导出的评分 Excel。
+
+        读 ``rating_out``（⑤ 已把它筛成 1~3 星，再筛一遍是幂等的）；它不在就退
+        回完整版 ``_评分原始``（真机评分导出其实是 **CSV**，所以 ``.csv`` 也认）。
+        完整版不存在时才先备份一份，避免覆盖丢数据。
+        返回 True 表示有差评可抓。
+        """
+        o = self.opts
+        out = Path(o.get("rating_out") or DEFAULT_RATING_OUT)
+        candidates = rating_file_candidates(out)
+        raw_candidates = [p for p in candidates if p != out]
+        src = next((p for p in candidates if p.exists()), out)
+        raw_out = next((p for p in raw_candidates if p.exists()), raw_candidates[0])
+        if not src.exists():
+            self.log.emit(f"✖ 找不到评分文件：{out} / {' / '.join(str(p) for p in raw_candidates)}\n"
+                          "   → 先点「导出商品评分」，或把文件路径填到「评分 Excel」框。")
+            return False
+        self.stage.emit("读取商品评分")
+        self.log.emit(f"===== 读取商品评分：{src.name} =====")
+        try:
+            header, rows = te.parse_rating(src)
+        except Exception as exc:
+            self.log.emit(f"✖ 读评分文件失败：{type(exc).__name__}: {exc}")
+            return False
+        if not rows:
+            self.log.emit("⚠ 评分文件里没有数据行 → ⑥ 跳过")
+            return False
+        # 读的是「已筛过的 out」且完整版还没存过 → 先另存一份再覆盖。
+        # 读的是完整版（raw）就不用备份：它自己就是完整版。
+        if src == out and not raw_out.exists():
+            try:
+                te.write_rows(header, rows, raw_out, sheet="商品评分")
+                self.log.emit(f"完整版另存：{raw_out}")
+            except Exception as exc:
+                self.log.emit(f"[提示] 完整版另存失败（忽略）：{exc}")
+        self._apply_rating_filter(header, rows, out)
+        self.rating_ready.emit(self._rating_bad if self._bad_hit else self._rating_all)
+        return bool(self._bad_hit)
+
     # -- 客户 ---------------------------------------------------------------
     def _resolve_customer_ids(self, rows: list[dict[str, str]]) -> list[str]:
         if rows:
@@ -590,6 +821,56 @@ class PipelineThread(QThread):
             raise zb.ZiniaoBridgeError(
                 f"在「{self.opts.get('order_column') or 'Order ID'}」列没有读到有效 Order ID（{src}）")
         return ids
+
+    @staticmethod
+    def _sku_col_of(row: dict[str, str]) -> str:
+        """在导出行里找「商品 SKU 的 SKU ID」那一列的实际列名（平台各版本叫法不同）。"""
+        wanted = {tc.norm_col(c) for c in tc.SKU_SOURCE_COLUMNS}
+        for key in row.keys():
+            if tc.norm_col(key) in wanted:
+                return str(key)
+        return ""
+
+    @classmethod
+    def _sku_map_from_rows(cls, rows: list[dict[str, str]]) -> dict[str, str]:
+        """把③刚导出的订单表折叠成 {Order ID: SKU ID}（一个订单多 SKU 合并）。"""
+        parts: dict[str, list[str]] = {}
+        for row in rows or []:
+            col = cls._sku_col_of(row)
+            if not col:
+                return {}
+            oid = str(row.get("Order ID") or "").strip()
+            if not oid.isdigit() or len(oid) < 10:
+                continue
+            val = row.get(col)
+            if val:
+                parts.setdefault(oid, []).append(val)
+        return {oid: tc.join_skus(v) for oid, v in parts.items()}
+
+    def _load_sku_map(self, rows: list[dict[str, str]]) -> tuple[dict[str, str], str]:
+        """订单 ID → 商品 SKU 的 SKU ID（**兜底用**），返回 ``(映射, 来源说明)``。
+
+        主源是接口响应里的 ``sku_module``（请求本身就带着），这张表只负责两种情形：
+          ① 响应里没有 sku 节点；② 请求失败/中止的占位行 —— 它们没有响应可用。
+        取的是**平台 SKU ID**，不是「Seller SKU」（商家自定义编码）。
+        """
+        if rows:
+            got = self._sku_map_from_rows(rows)
+            if got:
+                return got, "③导出的订单表"
+        src = Path(self.opts.get("customer_input") or "")
+        if src.exists():
+            try:
+                got = tc.read_sku_map(
+                    src, self.opts.get("customer_sheet") or None,
+                    self.opts.get("order_column") or "Order ID")
+            except Exception as exc:  # SKU 是附加列，读不到不该中断抓客户
+                self.log.emit("[提示] 读取订单表 SKU ID 失败（忽略，该列留空）："
+                              f"{type(exc).__name__}: {exc}")
+                got = {}
+            if got:
+                return got, f"订单文件 {src.name}"
+        return {}, ""
 
     def _heal_store_identity(self, browser: Any, client_obj: tc.OrderClient,
                              ids: list[str], cur_sid: str,
@@ -679,6 +960,60 @@ class PipelineThread(QThread):
                           "（区域站会互相重定向，抓客户按落地站发）")
         return landed
 
+    def _captcha_guard(self, browser: Any, throttle: float = 0.0) -> bool:
+        """验证码闸门：没有验证码 → 直接返回 False（一次轻量 eval）；有 → 自动
+        「取图 → 算缺口 → 拖滑块」，最多试 3 把。任何异常都不打断抓取。
+
+        ★ 它有两个调用时机，缺一不可 ★
+        1. **每单发请求之前** —— 上一次留下的验证码（还没消失）先过掉；
+        2. **请求等响应的期间**（``BrowserTransport.wait_hook``）—— 验证码其实
+           是**请求发出去之后**才弹的，而且会把这条请求 hold 住。等超过 2s 还没
+           回来就说明多半是它，这时过掉验证码，被挂起的请求才有机会返回。
+
+        ``throttle``：大于 0 时，距上次**实际检测**不足这么多秒就直接返回
+        （等响应期间每 0.35s 会调一次，不能每次都真查）。返回 True 表示
+        「这一下刚处理过验证码」，调用方可以据此重试/重新计时。
+        """
+        if browser is None:
+            return False
+        now = time.monotonic()
+        if throttle and now - getattr(self, "_captcha_at", 0.0) < throttle:
+            return False
+        self._captcha_at = now
+        try:
+            if cs.detect(browser) is None:
+                return False
+        except Exception:
+            return False
+        self.log.emit("⚠ 页面上出现了验证码，开始自动处理…")
+        try:
+            r = cs.solve(browser, log=lambda m: self.log.emit(str(m)),
+                         dump_dir=BASE_DIR / "_captcha_dump")
+        except Exception as exc:
+            self.log.emit(f"[验证码] 处理异常：{type(exc).__name__}: {exc}")
+            return False
+        if r.get("ok"):
+            if r.get("skipped"):
+                self.log.emit("[验证码] 处理时验证码已消失，继续抓取")
+            else:
+                self.log.emit(f"[验证码] ✅ 已通过（{r.get('attempts')} 次尝试），继续抓取")
+            return True
+        self.log.emit(f"[验证码] ✖ 没通过：{r.get('error')}"
+                      "—— 后续请求可能失败；也可以手动在浏览器里完成验证后点继续")
+        return False
+
+    def _attach_captcha_hook(self, browser: Any, client_obj: Any) -> None:
+        """把「等响应期间过验证码」挂到浏览器传输层上（见 ``_captcha_guard`` 第 2 条）。
+
+        只有在传输层是 ``BrowserTransport``（页面内 fetch）时才有意义 —— 本地直连
+        通道不会弹验证码。挂不上就算了，不影响抓取。
+        """
+        tp = getattr(client_obj, "transport", None)
+        if tp is None or not hasattr(tp, "wait_hook"):
+            return
+        tp.wait_hook = lambda: self._captcha_guard(browser, throttle=2.0)
+        self.log.emit("[验证码] 已开启「请求等待期间自动处理」（验证码不会再把请求挂死）")
+
     def _fetch_customers(self, browser: Any, client_obj: tc.OrderClient,
                          rows: list[dict[str, str]],
                          origins: list[str] | None = None) -> dict[str, Any]:
@@ -692,11 +1027,23 @@ class PipelineThread(QThread):
         self.log.emit(f"===== 抓取客户信息：{len(ids)} 条，间隔 {interval}s =====")
         self.customer_progress.emit(0, len(ids))
 
+        # SKU ID 兜底：接口响应优先，没响应的行（失败/中止）由订单表补齐
+        sku_map, sku_src = self._load_sku_map(rows)
+        self._sku_map_cache = sku_map   # ⑥ 直接用，不重复读订单表
+        if sku_map:
+            self.log.emit(f"SKU ID 兜底表已就绪：{len(sku_map)} 条（来源：{sku_src}）")
+        else:
+            self.log.emit("[提示] 订单表里没有 SKU ID 列，SKU 只取接口响应里的值")
+
         # ★ 抓客户前必须把页面停回**订单页** ★
         # 2026-10-14 用户真机定案：同源 fetch 只在订单页上成立 —— 站选对了但页面
         # 停在首页/工作台，一样是 98001008「需要权限」。③ 导出本来就在订单页上，
         # 但下载与面板操作都可能把页面带偏，所以这里显式回一次。
         self._ensure_order_page(browser)
+        self._captcha_guard(browser)        # 页面停好后先看一眼有没有验证码
+        # 验证码多一半是**请求发出去之后**才弹的，且会把该请求挂住 → 等响应期间
+        # 也要能过验证码，否则那一单会一直等到超时（看着像卡死）。
+        self._attach_captcha_hook(browser, client_obj)
 
         # ---- 店铺身份预检：先拿前 3 条试水，别等跑完几百条才发现全错 ----
         try:
@@ -736,7 +1083,8 @@ class PipelineThread(QThread):
                               f"{client_obj.seller_id}"
                               f"（{zb.store_name_of(client_obj.seller_id) or '未登记'}）")
             else:
-                results0 = {oid: tc.blank_customer(oid, "SKIPPED") for oid in ids}
+                results0 = {oid: tc.blank_customer(oid, "SKIPPED", sku_map.get(oid, ""))
+                            for oid in ids}
                 self.log.emit("")
                 self.log.emit("✖ 所有候选区域站都看不到这批订单，已中止抓客户"
                               "（后面的请求只会重复同样的错误）")
@@ -761,27 +1109,44 @@ class PipelineThread(QThread):
                 self.log.emit("已手动停止，写出已抓取的数据…")
                 break
             if fatal:  # 已判定是店铺/凭据问题：补齐占位行收工，不再发请求
-                row = tc.blank_customer(oid, "SKIPPED")
+                row = tc.blank_customer(oid, "SKIPPED", sku_map.get(oid, ""))
                 results[oid] = row
                 self.customer_row.emit(i, row)
                 self.customer_progress.emit(i + 1, len(ids))
                 continue
+            self._captcha_guard(browser)    # ★ 每单之前：有验证码先自动过掉
             try:
                 payload = client_obj.fetch([oid], chunk_size=1)
                 orders = ((payload.get("data") or {}).get("main_order")) or []
                 if not orders:
-                    row = tc.blank_customer(oid, "EMPTY")
+                    row = tc.blank_customer(oid, "EMPTY", sku_map.get(oid, ""))
                     fail += 1
                     self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 无数据返回")
                 else:
-                    row = tc.parse_customer(orders[0])
+                    row = tc.parse_customer(orders[0], sku_map.get(oid, ""))
                     ok += 1
                     self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → "
                                   f"{row.get('Buyer Nickname', '')} {row.get('Recipient', '')}")
             except tc.ApiError as exc:
-                row = tc.blank_customer(oid, "API_ERROR")
+                row = tc.blank_customer(oid, "API_ERROR", sku_map.get(oid, ""))
                 fail += 1
                 self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 失败：{exc}")
+                # ★ 页面请求超时 = 多半是验证码把这一单挂住了：过掉验证码再试一次 ★
+                if str(exc.code) == "timeout" and browser is not None:
+                    if self._captcha_guard(browser, throttle=0.5):
+                        try:
+                            payload = client_obj.fetch([oid], chunk_size=1)
+                            orders = ((payload.get("data") or {}).get("main_order")) or []
+                            if orders:
+                                row = tc.parse_customer(orders[0], sku_map.get(oid, ""))
+                                ok += 1
+                                fail -= 1
+                                self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 过验证码后重试成功："
+                                              f"{row.get('Buyer Nickname', '')} "
+                                              f"{row.get('Recipient', '')}")
+                        except Exception as exc2:
+                            self.log.emit(f"   过验证码后重试仍失败："
+                                          f"{type(exc2).__name__}: {exc2}")
                 if exc.is_fatal and not fatal:
                     # 保险：预检通过了但首条就撞凭据错误 —— 通道在这一路上还会
                     # 再扫一遍区域站并锁定可用组合，所以复检一次再决定中止与否。
@@ -798,14 +1163,16 @@ class PipelineThread(QThread):
                             payload = client_obj.fetch([oid], chunk_size=1)
                             orders = ((payload.get("data") or {}).get("main_order")) or []
                             if orders:
-                                row = tc.parse_customer(orders[0])
+                                row = tc.parse_customer(orders[0],
+                                                         sku_map.get(oid, ""))
                                 ok += 1
                                 fail -= 1
                                 self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → "
                                               f"{row.get('Buyer Nickname', '')} "
                                               f"{row.get('Recipient', '')}")
                             else:
-                                row = tc.blank_customer(oid, "EMPTY")
+                                row = tc.blank_customer(oid, "EMPTY",
+                                                          sku_map.get(oid, ""))
                         except Exception as exc2:
                             self.log.emit(f"   重试仍失败：{type(exc2).__name__}: {exc2}")
                     else:
@@ -816,11 +1183,13 @@ class PipelineThread(QThread):
                         self.log.emit("请核对③里打开的店铺是否就是导出该订单表的店铺。")
                         self.log.emit("—" * 58)
             except Exception as exc:
-                row = tc.blank_customer(oid, "EXCEPTION")
+                row = tc.blank_customer(oid, "EXCEPTION", sku_map.get(oid, ""))
                 fail += 1
                 self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 异常："
                               f"{type(exc).__name__}: {exc}")
 
+            # 存进缓存：⑥ 差评客户会命中同一批订单，不重复发请求
+            self._cust_cache[oid] = row
             results[oid] = row
             self.customer_row.emit(i, row)
             self.customer_progress.emit(i + 1, len(ids))
@@ -833,6 +1202,286 @@ class PipelineThread(QThread):
         final = self._flush_customers(results, ids, out)
         self.log.emit(f"客户信息抓取结束：成功 {ok}，失败 {fail}，已写入 {final}")
         return {"ok": ok, "fail": fail, "out": str(final)}
+
+    # -- ⑥ 差评客户 ---------------------------------------------------------
+    @staticmethod
+    def _norm(value: Any) -> str:
+        """昵称/商品名归一化：只消大小写与首尾空格，保留脱敏的 *****（对不上就是
+        对不上，别伪装成匹配）。"""
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _cols_of(row: dict[str, Any], names: Sequence[str]) -> list[str]:
+        """取行里这一族列的值（列名按导出文件实际写法，不写死）。"""
+        out: list[str] = []
+        for key in row.keys():
+            if te.norm_key(key) in [te.norm_key(n) for n in names]:
+                val = row.get(key)
+                if val:
+                    out.append(str(val))
+        return out
+
+    def _order_index(self, order_rows: list[dict[str, str]]) -> dict[str, Any]:
+        """订单表 → {昵称: {"ids": [...], "prods": [(商品名, oid), ...]}}。
+
+        **兜底路径专用**：评分文件里没有订单号列（老版「仅昵称」文件）时才用它，
+        先在订单表里建这个索引，⑥ 才能把 1~3 星的评价换成订单号去抓客户。
+        真机评分 CSV 自带 order_id，走不到这里。
+        订单行优先用③刚导出的那批（内存里），没有才回读订单 Excel。
+        """
+        rows = list(order_rows or [])
+        if not rows:
+            src = Path(self.opts.get("customer_input")
+                       or self.opts.get("order_out") or "")
+            if src.exists():
+                header, data = te.parse_export(src)
+                rows = [dict(zip(header, r)) for r in data]
+        index: dict[str, Any] = {}
+        for row in rows:
+            oid = str(row.get("Order ID") or "").strip()
+            if not (oid.isdigit() and len(oid) >= 8):
+                continue
+            nicks = self._cols_of(row, te.ORDER_BUYER_COLUMNS)
+            prods = self._cols_of(row, te.RATING_PRODUCT_COLUMNS)
+            for nick in nicks:
+                nk = self._norm(nick)
+                if not nk:
+                    continue
+                node = index.setdefault(nk, {"ids": [], "prods": []})
+                if oid not in node["ids"]:
+                    node["ids"].append(oid)
+                for prod in prods:
+                    pk = self._norm(prod)
+                    if pk:
+                        node["prods"].append((pk, oid))
+        return index
+
+    @staticmethod
+    def _order_id(value: Any) -> str:
+        """订单号单元格 → 纯数字串（认不出返回空串）。
+
+        表格里的订单号可能是文本、也可能是数字单元格（Excel 读出来是 float，
+        甚至被写成 ``5.7758E+17`` 这种科学计数），一律先归一再验长度。
+        """
+        text = str(value or "").strip().replace("#", "").replace(" ", "")
+        if not text:
+            return ""
+        if text.endswith(".0"):
+            text = text[:-2]
+        if not text.isdigit():
+            # ★ 只有「不是纯数字」时才走 float 换算（科学计数 / 数字单元格）。
+            #   已经是一串数字的就**绝不能**碰 —— float 只有 53 位精度，
+            #   577589364214960772 会被改成 …768，订单号直接查不到。
+            try:
+                num = float(text)
+                if num.is_integer():
+                    text = str(int(num))
+            except (TypeError, ValueError):
+                return ""
+        return text if (text.isdigit() and len(text) >= 8) else ""
+
+    def _match_orders(self, index: dict[str, Any], nick: str,
+                      product: str) -> list[str]:
+        """先用「昵称+商品」精确锁定，锁不到再退回「只用昵称」。"""
+        node = index.get(nick) or {}
+        if not node:
+            return []
+        if product:
+            hit: list[str] = []
+            for p, oid in node.get("prods") or []:
+                # 完全相等，或一方包含另一方（商品名常被截断）
+                if p == product or (len(p) >= 8 and (p in product or product in p)):
+                    if oid not in hit:
+                        hit.append(oid)
+            if hit:
+                return hit
+        return list(node.get("ids") or [])
+
+    def _fetch_bad_customers(self, browser: Any, client_obj: tc.OrderClient,
+                             bad_rows: list[dict[str, Any]],
+                             origins: list[str] | None,
+                             order_rows: list[dict[str, str]]) -> dict[str, Any]:
+        """⑥ 把 1~3 星评价对应的客户抓出来，写 `<店铺名>_客户差评信息.xlsx`。
+
+        链条：⑤ 筛出的差评行 →**订单号**→ order/get → 客户行 + 评分 + 商品。
+        订单号优先取评分文件自带的那一列（真机 CSV 就有）；老版「仅昵称」的文件
+        才退回去拿（昵称+商品）查订单表换 Order ID。④ 抓过的订单直接复用缓存，
+        不发第二次请求。
+        """
+        o = self.opts
+        self.stage.emit("抓取差评客户")
+        out = Path(o.get("bad_out") or DEFAULT_BAD_CUSTOMER_OUT)
+        interval = float(o.get("interval") or 0.0)
+        cols = self._rating_cols
+        buyer_col = cols.get("buyer") or ""
+        product_col = cols.get("product") or ""
+        score_col = cols.get("score") or ""
+        order_col = cols.get("order") or ""
+
+        self.log.emit(f"===== 抓取差评客户：1~3 星 {len(bad_rows)} 条 =====")
+
+        # ---- 差评行 → 订单号（同一订单只留第一条差评）----
+        # ① 评分文件自带订单号列（真机 CSV 就是这样）→ 直接用，最省事也最准；
+        # ② 老版文件只有买家昵称 → 回订单表反查（可能因脱敏 K***** 匹配不上）。
+        pairs: list[tuple[str, dict[str, Any]]] = []
+        seen: set[str] = set()
+        missed = 0
+        if order_col:
+            self.log.emit(f"评分文件自带订单号列「{order_col}」→ 直接取订单号，不查订单表")
+            for row in bad_rows:
+                oid = self._order_id(row.get(order_col))
+                if not oid:
+                    missed += 1
+                    continue
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                pairs.append((oid, row))
+        else:
+            if not buyer_col:
+                self.log.emit("✖ 评分表里既没订单号列、也没认出买家昵称列 → "
+                              "无法定位订单，⑥ 跳过")
+                self.log.emit("   评分文件实际列名：" + "，".join(self._rating_header[:10]))
+                self.log.emit("   → 把列名发我，加进 te.RATING_ORDER_COLUMNS / "
+                              "te.RATING_BUYER_COLUMNS 即可")
+                return {"ok": 0, "fail": 0, "out": "", "rows": []}
+
+            index = self._order_index(order_rows)
+            if not index:
+                self.log.emit("✖ 订单表里没有可用的买家昵称列，⑥ 跳过"
+                              "（③ 没跑过就先跑一次导出订单）")
+                return {"ok": 0, "fail": 0, "out": "", "rows": []}
+            self.log.emit(f"订单索引：{len(index)} 个买家")
+
+            for row in bad_rows:
+                nick = self._norm(row.get(buyer_col))
+                if not nick:
+                    missed += 1
+                    continue
+                ids = self._match_orders(index, nick, self._norm(row.get(product_col)))
+                if not ids:
+                    missed += 1
+                    continue
+                for oid in ids:
+                    if oid in seen:
+                        continue
+                    seen.add(oid)
+                    pairs.append((oid, row))
+        if missed:
+            self.log.emit(f"[提示] {missed}/{len(bad_rows)} 条差评没匹配到订单"
+                          "（昵称可能在评分文件里被平台脱敏成 K*****）")
+        if not pairs:
+            self.log.emit("⚠ 没有一条差评能对应到订单 → 不写差评客户表")
+            return {"ok": 0, "fail": 0, "out": "", "rows": []}
+        self.log.emit(f"差评 → 订单：{len(pairs)} 单待抓")
+
+        # ★ 抓客户前必须把页面停回**订单页**（和④同一个前提：站对、页不对照样
+        #   98001008）。⑤ 结束时页面还在 /product/rating 上。
+        self._ensure_order_page(browser)
+        self._attach_captcha_hook(browser, client_obj)   # 同④：等响应期间也要能过验证码
+
+        # 单独跑⑥时④没跑过，缓存是空的 —— 这里自己按订单表补一份
+        if not self._sku_map_cache and order_rows is not None:
+            self._sku_map_cache, _src = self._load_sku_map(list(order_rows))
+            if self._sku_map_cache:
+                self.log.emit(f"SKU ID 兜底表已就绪：{len(self._sku_map_cache)} 条"
+                              f"（来源：{_src}）")
+        sku_map = self._sku_map_cache or {}
+        results: list[dict[str, str]] = []
+        ok = fail = 0
+        fatal = False
+        for i, (oid, rrow) in enumerate(pairs):
+            if self.stop_event.is_set():
+                self.log.emit("已手动停止，写出已抓取的数据…")
+                break
+            score = te.rating_value(rrow.get(score_col)) if score_col else 0
+            extra = {"评分": str(score) if score else str(rrow.get(score_col) or ""),
+                     "商品": str(rrow.get(product_col) or "") if product_col else ""}
+            if fatal:
+                results.append(self._bad_row(
+                    tc.blank_customer(oid, "SKIPPED", sku_map.get(oid, "")), extra))
+                continue
+            cached = self._cust_cache.get(oid)
+            if cached:                       # ④ 已经抓过 —— 直接复用，不重复请求
+                results.append(self._bad_row(dict(cached), extra))
+                ok += 1
+                self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 复用④的结果")
+            else:
+                self._captcha_guard(browser)    # ★ 真要发请求前：有验证码先自动过掉
+                try:
+                    payload = client_obj.fetch([oid], chunk_size=1)
+                    orders = ((payload.get("data") or {}).get("main_order")) or []
+                    if orders:
+                        results.append(self._bad_row(
+                            tc.parse_customer(orders[0], sku_map.get(oid, "")), extra))
+                        ok += 1
+                        self._cust_cache[oid] = results[-1]
+                        self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → "
+                                      f"{results[-1].get('Buyer Nickname', '')}")
+                    else:
+                        results.append(self._bad_row(
+                            tc.blank_customer(oid, "EMPTY", sku_map.get(oid, "")),
+                            extra))
+                        fail += 1
+                        self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 无数据返回")
+                except tc.ApiError as exc:
+                    results.append(self._bad_row(
+                        tc.blank_customer(oid, "API_ERROR", sku_map.get(oid, "")),
+                        extra))
+                    fail += 1
+                    self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 失败：{exc}")
+                    # ★ 超时 = 多半被验证码挂住了：过掉验证码再试一次 ★
+                    if str(exc.code) == "timeout" and browser is not None:
+                        if self._captcha_guard(browser, throttle=0.5):
+                            try:
+                                payload = client_obj.fetch([oid], chunk_size=1)
+                                orders = ((payload.get("data") or {})
+                                          .get("main_order")) or []
+                                if orders:
+                                    results[-1] = self._bad_row(
+                                        tc.parse_customer(orders[0],
+                                                          sku_map.get(oid, "")), extra)
+                                    ok += 1
+                                    fail -= 1
+                                    self._cust_cache[oid] = dict(results[-1])
+                                    self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → "
+                                                  f"过验证码后重试成功："
+                                                  f"{results[-1].get('Buyer Nickname', '')}")
+                            except Exception as exc2:
+                                self.log.emit(f"   过验证码后重试仍失败："
+                                              f"{type(exc2).__name__}: {exc2}")
+                    if exc.is_fatal and not fatal:
+                        fatal = True
+                        self.log.emit("—" * 58)
+                        self.log.emit(f"⑥ 已中止：{exc.code} 是店铺/凭据问题，"
+                                      f"剩下的 {len(pairs) - i - 1} 条不再请求。")
+                except Exception as exc:
+                    results.append(self._bad_row(
+                        tc.blank_customer(oid, "EXCEPTION", sku_map.get(oid, "")),
+                        extra))
+                    fail += 1
+                    self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 异常："
+                                  f"{type(exc).__name__}: {exc}")
+            self.bad_progress.emit(len(results), len(pairs))
+            if not self.stop_event.is_set() and i + 1 < len(pairs) and interval > 0:
+                time.sleep(interval)
+
+        final = self._flush_bad_customers(results, out)
+        self.log.emit(f"差评客户抓取结束：成功 {ok}，失败 {fail}，已写入 {final}")
+        return {"ok": ok, "fail": fail, "out": str(final), "rows": results}
+
+    @staticmethod
+    def _bad_row(cust: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
+        """客户行 + 差评信息（评分 / 商品），列顺序 = 客户列 + 评分 + 商品。"""
+        out = dict(cust)
+        out.update(extra)
+        return out
+
+    @staticmethod
+    def _flush_bad_customers(rows: list[dict[str, str]], out: Path) -> Path:
+        cols = BAD_CUSTOMER_COLUMNS
+        return te.write_rows(cols, [[r.get(c, "") for c in cols] for r in rows],
+                             out, sheet="客户差评")
 
     @staticmethod
     def _flush_customers(results: dict[str, dict[str, str]], ids: list[str],
@@ -989,6 +1638,8 @@ class MainWindow(QMainWindow):
         self._fields: list[tuple[str, str]] = []
         self.env_ready = False
         self.worker: Any = None
+        # 「浏览…」上次选过的存放目录 —— 让四个输出框能连着收到同一个文件夹里
+        self._last_out_dir: str = ""
 
         self.log_bus = LogBus()
         self.log_bus.message.connect(self._append_log)
@@ -999,7 +1650,9 @@ class MainWindow(QMainWindow):
 
         self._load_config(initial=True)
         self._set_busy("idle")
-        self.log_line("就绪。顺序：①启动环境 → ②获取店铺列表 → ③选店铺并导出订单 → ④抓客户信息。")
+        self.log_line("就绪。顺序：①启动环境 → ②获取店铺列表 → ③选店铺并导出订单 "
+                      "→ ④抓客户信息 → ⑤导出商品评分 → ⑥抓差评客户。"
+                      "⑤⑥ 各有一颗按钮，可分开单独执行。")
 
     # -- 界面构建 -----------------------------------------------------------
     def _build_ui(self) -> None:
@@ -1016,6 +1669,7 @@ class MainWindow(QMainWindow):
         rv.setSpacing(8)
         rv.addWidget(self._build_order_box())
         rv.addWidget(self._build_customer_box())
+        rv.addWidget(self._build_rating_box())
         rv.addLayout(self._build_run_bar())
         rv.addStretch(0)
 
@@ -1028,8 +1682,12 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tbl_orders = self._make_table(tc.ORDER_COLUMNS)
         self.tbl_customers = self._make_table(tc.CUSTOMER_COLUMNS)
+        self.tbl_rating = self._make_table([])   # 列由导出文件的表头决定
+        self.tbl_bad = self._make_table(BAD_CUSTOMER_COLUMNS)
         self.tabs.addTab(self.tbl_orders, "订单列表")
         self.tabs.addTab(self.tbl_customers, "客户信息")
+        self.tabs.addTab(self.tbl_rating, "商品评分")
+        self.tabs.addTab(self.tbl_bad, "客户差评")
 
         main = QSplitter(Qt.Orientation.Vertical)
         main.addWidget(top)
@@ -1101,23 +1759,13 @@ class MainWindow(QMainWindow):
         grid.addLayout(bar, 4, 0, 1, 4)
 
         # 默认**不**勾选：客户端已在运行就直接复用，不再把它关掉重启。
-        # 紫鸟在自动化（web_driver）模式下本来就没有主界面，重启只会让界面消失。
         self.chk_kill = QCheckBox("强制重启客户端（会关掉已有的紫鸟实例）")
         self.chk_kill.setChecked(False)
         self.chk_kill.setToolTip(
             "默认不勾选：检测到客户端已在运行就直接复用。\n"
-            "勾选后：先杀掉所有紫鸟进程、再以后台方式重启。\n"
+            "勾选后：先杀掉所有紫鸟进程、再重新拉起一个 web_driver 实例。\n"
             "只有「端口被占死 / 复用后店铺打不开」时才需要勾。")
         grid.addWidget(self.chk_kill, 5, 0, 1, 4)
-
-        # 店铺浏览器窗口是否可见 —— 这才是能看见 TikTok 后台的那个窗口
-        self.chk_visible = QCheckBox("显示店铺浏览器窗口（取消则后台无头运行）")
-        self.chk_visible.setChecked(True)
-        self.chk_visible.setToolTip(
-            "打开店铺时 isHeadless=0：弹出真实 Chromium 窗口，\n"
-            "能直接看到页面停在订单页，排查问题时很有用。\n"
-            "取消勾选 = isHeadless=1，纯后台跑，快一点但看不见。")
-        grid.addWidget(self.chk_visible, 6, 0, 1, 4)
 
         grid.setColumnStretch(1, 1)
         return box
@@ -1151,6 +1799,28 @@ class MainWindow(QMainWindow):
         self.lbl_selected = QLabel("已选店铺：—")
         self.lbl_selected.setWordWrap(True)
         v.addWidget(self.lbl_selected)
+
+        # 账号下挂了多个后台店铺时（如「秋图2」= Spain + United States），
+        # 打开后台后**按 URL 直接导航**到目标店铺的后台首页
+        # （https://seller.<区域>.tiktokshopglobalselling.com/homepage?shop_region=XX）。
+        # 下拉候选是内置的市场名；也可以手填区域码（US/ES/GB…）或直接贴后台 URL。
+        shop_row = QHBoxLayout()
+        shop_row.addWidget(QLabel("后台店铺："))
+        self.cb_shop = QComboBox()
+        self.cb_shop.setEditable(True)
+        for name in te.SHOP_CHOICES:
+            self.cb_shop.addItem(name)
+        if DEFAULT_TARGET_SHOP not in te.SHOP_CHOICES:
+            self.cb_shop.addItem(DEFAULT_TARGET_SHOP)
+        self.cb_shop.setCurrentText(DEFAULT_TARGET_SHOP)
+        self.cb_shop.setMinimumWidth(180)
+        self.cb_shop.setToolTip(
+            "账号下要用的后台店铺（如 United States）。\n"
+            "做法是按店铺对应的 shop_region **直接导航**到该店的后台首页，"
+            "不模拟点击右上角切换器。\n"
+            "已经在目标店铺时不动页面。也可直接填区域码（US / ES / GB）或后台 URL。")
+        shop_row.addWidget(self.cb_shop, 1)
+        v.addLayout(shop_row)
         return box
 
     def _build_order_box(self) -> QGroupBox:
@@ -1168,10 +1838,15 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("订单 Excel："), 0, 0)
         self.ed_order_out = QLineEdit(str(DEFAULT_ORDER_OUT))
         self.ed_order_out.setMinimumWidth(120)
-        self.ed_order_out.setToolTip("默认按店铺命名（选中店铺后自动填入）；点「另存为…」可改")
+        self.ed_order_out.setToolTip(
+            "文件名默认按店铺命名（选中店铺后自动填入）。\n"
+            "点「浏览…」只换**存放目录**，文件名不变；\n"
+            "想连文件名一起改，直接在这个框里敲完整路径。")
         grid.addWidget(self.ed_order_out, 0, 1, 1, 3)
-        btn_out = QPushButton("另存为…")
-        btn_out.clicked.connect(lambda: self._pick_save(self.ed_order_out, DEFAULT_ORDER_OUT))
+        btn_out = QPushButton("浏览…")
+        btn_out.setToolTip("选择订单文件的存放目录（文件名保持 <店铺名>_订单.xlsx）")
+        btn_out.clicked.connect(
+            lambda: self._pick_output_dir(self.ed_order_out, DEFAULT_ORDER_OUT))
         grid.addWidget(btn_out, 0, 4)
 
         bar = QHBoxLayout()
@@ -1220,9 +1895,14 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("客户 Excel："), 2, 0)
         self.ed_cust_out = QLineEdit(str(DEFAULT_CUSTOMER_OUT))
         self.ed_cust_out.setMinimumWidth(120)
+        self.ed_cust_out.setToolTip(
+            "文件名默认按店铺命名（选中店铺后自动填入）。\n"
+            "点「浏览…」只换存放目录，文件名不变；想连文件名一起改就直接敲完整路径。")
         grid.addWidget(self.ed_cust_out, 2, 1, 1, 3)
-        btn_out = QPushButton("另存为…")
-        btn_out.clicked.connect(lambda: self._pick_save(self.ed_cust_out, DEFAULT_CUSTOMER_OUT))
+        btn_out = QPushButton("浏览…")
+        btn_out.setToolTip("选择客户文件的存放目录（文件名保持 <店铺名>_客户.xlsx）")
+        btn_out.clicked.connect(
+            lambda: self._pick_output_dir(self.ed_cust_out, DEFAULT_CUSTOMER_OUT))
         grid.addWidget(btn_out, 2, 4)
 
         grid.addWidget(QLabel("请求间隔(秒)："), 3, 0)
@@ -1254,18 +1934,100 @@ class MainWindow(QMainWindow):
         grid.setColumnStretch(1, 1)
         return box
 
+    def _build_rating_box(self) -> QGroupBox:
+        """⑤ 商品评分 —— 走评分页自己的「导出」按钮，和订单那套是两条路。
+
+        评分页**没有**订单页那种「导出范围 / 格式」面板，只有一颗导出按钮；
+        点完可能立刻下载，也可能进导出历史异步生成，两种都实现了（见
+        ``tiktok_export.RatingExporter``）。
+        """
+        box = QGroupBox("⑤ 导出商品评分（/product/rating 页面的「导出」按钮）")
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        grid.addWidget(QLabel("评分 Excel："), 0, 0)
+        self.ed_rating_out = QLineEdit(str(DEFAULT_RATING_OUT))
+        self.ed_rating_out.setMinimumWidth(120)
+        self.ed_rating_out.setToolTip(
+            "文件名默认按店铺命名（选中店铺后自动填入）。\n"
+            "点「浏览…」只换存放目录，文件名不变；想连文件名一起改就直接敲完整路径。")
+        grid.addWidget(self.ed_rating_out, 0, 1, 1, 3)
+        btn_out = QPushButton("浏览…")
+        btn_out.setToolTip("选择评分文件的存放目录（文件名保持 <店铺名>_商品评分.xlsx）")
+        btn_out.clicked.connect(
+            lambda: self._pick_output_dir(self.ed_rating_out, DEFAULT_RATING_OUT))
+        grid.addWidget(btn_out, 0, 4)
+
+        # ⑥ 差评客户：优先用评分文件自带的订单号；没有才靠昵称回订单表
+        grid.addWidget(QLabel("客户差评 Excel："), 1, 0)
+        self.ed_bad_out = QLineEdit(str(DEFAULT_BAD_CUSTOMER_OUT))
+        self.ed_bad_out.setMinimumWidth(120)
+        self.ed_bad_out.setToolTip(
+            "⑥ 抓取 1~3 星评价对应客户的收货信息，文件名默认按店铺命名。\n"
+            "点「浏览…」只换存放目录，文件名不变；想连文件名一起改就直接敲完整路径。\n"
+            "评分文件自带订单号列（真机导出的 CSV 就有）时不需要订单表；\n"
+            "只有老版「仅昵称」的评分文件才需要③的订单表做关联。")
+        grid.addWidget(self.ed_bad_out, 1, 1, 1, 3)
+        btn_bad = QPushButton("浏览…")
+        btn_bad.setToolTip("选择差评客户文件的存放目录（文件名保持 <店铺名>_客户差评信息.xlsx）")
+        btn_bad.clicked.connect(
+            lambda: self._pick_output_dir(self.ed_bad_out, DEFAULT_BAD_CUSTOMER_OUT))
+        grid.addWidget(btn_bad, 1, 4)
+
+        # ⑤ 和 ⑥ 是两颗**独立**的按钮：可以只导出评分，也可以拿一份已经导好的
+        # 评分表直接抓差评客户（不用重新开评分页导一次，省一两分钟）。
+        bar = QHBoxLayout()
+        self.btn_rating = QPushButton("导出商品评分")
+        self.btn_rating.clicked.connect(lambda: self._start_pipeline(
+            do_orders=False, do_customers=False, do_rating=True))
+        self.btn_rating.setToolTip("走评分页的「导出」按钮导出，筛出 1~3 星后覆盖保存；"
+                                   "完整版留在 _评分原始.xlsx")
+        bar.addWidget(self.btn_rating)
+
+        self.btn_bad = QPushButton("抓取差评客户（1~3 星）")
+        self.btn_bad.clicked.connect(lambda: self._start_pipeline(
+            do_orders=False, do_customers=False, do_rating=False, do_bad=True))
+        self.btn_bad.setToolTip(
+            "读「评分 Excel」框里那份文件 → 筛 1~3 星覆盖保存 → 按昵称回订单表换出\n"
+            "订单号 → order/get 抓客户 → 写「客户差评 Excel」。\n"
+            "评分还没导出（或里面没有 1~3 星）时会照实提示，不会写出空表。")
+        bar.addWidget(self.btn_bad)
+        bar.addStretch(1)
+        grid.addLayout(bar, 2, 0, 1, 5)
+
+        grid.setColumnStretch(1, 1)
+        return box
+
     def _build_run_bar(self) -> QHBoxLayout:
         bar = QHBoxLayout()
-        self.btn_run_all = QPushButton("▶ 一键完成：导出订单 → 抓客户信息")
+        self.btn_run_all = QPushButton(
+            "▶ 一键完成：导出订单 → 抓客户信息 → 导出商品评分 → 抓差评客户")
         self.btn_run_all.setMinimumHeight(36)
-        self.btn_run_all.clicked.connect(lambda: self._start_pipeline(do_orders=True,
-                                                                     do_customers=True))
+        self.btn_run_all.clicked.connect(lambda: self._start_pipeline(
+            do_orders=True, do_customers=True,
+            do_rating=self.chk_rating.isChecked(),
+            do_bad=self.chk_bad.isChecked()))
         bar.addWidget(self.btn_run_all, 2)
 
         self.btn_stop = QPushButton("■ 停止")
         self.btn_stop.setMinimumHeight(36)
         self.btn_stop.clicked.connect(self._stop)
         bar.addWidget(self.btn_stop)
+
+        # 商品评分要额外开一次页面、等一次导出，不是每次都需要 —— 但默认跟着跑
+        self.chk_rating = QCheckBox("含商品评分")
+        self.chk_rating.setChecked(True)
+        self.chk_rating.setToolTip(
+            "一键完成时是否也导出商品评分（会多花一两分钟）。\n"
+            "只想跑订单 + 客户就取消勾选，或单独用 ⑤ 区那个按钮。")
+        bar.addWidget(self.chk_rating)
+
+        # ⑥ 依赖⑤的评分文件：一键完成时跟着勾选即可；评分不跑就自动跳过
+        self.chk_bad = QCheckBox("含差评客户")
+        self.chk_bad.setChecked(True)
+        self.chk_bad.setToolTip("⑤导出后筛出 1~3 星 → 覆盖保存评分表 → 再抓这些订单的客户")
+        bar.addWidget(self.chk_bad)
 
         self.lbl_stat = QLabel("等待开始")
         bar.addWidget(self.lbl_stat, 1)
@@ -1405,8 +2167,9 @@ class MainWindow(QMainWindow):
     def _set_busy(self, state: str) -> None:
         busy = state in ("env", "list", "pipe")
         for w in (self.btn_env, self.btn_list, self.btn_exit, self.btn_cfg,
-                  self.btn_orders, self.btn_customers, self.btn_run_all,
-                  self.ed_root, self.chk_kill):
+                  self.btn_orders, self.btn_customers, self.btn_rating,
+                  self.btn_bad, self.btn_run_all, self.ed_root, self.chk_kill,
+                  self.chk_rating, self.chk_bad, self.cb_shop):
             w.setEnabled(not busy)
         self.btn_stop.setEnabled(state == "pipe")
         if state == "env":
@@ -1656,11 +2419,13 @@ class MainWindow(QMainWindow):
         """
         if not store:
             return
-        order_path, cust_path = store_output_paths(store)
+        order_path, cust_path, rating_path, bad_path = store_output_paths(store)
         for attr, default, target in (
             ("ed_order_out", DEFAULT_ORDER_OUT, order_path),
             ("ed_cust_out", DEFAULT_CUSTOMER_OUT, cust_path),
             ("ed_cust_in", DEFAULT_ORDER_OUT, order_path),
+            ("ed_rating_out", DEFAULT_RATING_OUT, rating_path),
+            ("ed_bad_out", DEFAULT_BAD_CUSTOMER_OUT, bad_path),
         ):
             line = getattr(self, attr, None)
             if line is None:
@@ -1677,11 +2442,31 @@ class MainWindow(QMainWindow):
             return
         StoreJsonDialog(store, self).exec()
 
-    # -- ③④ 文件选择 --------------------------------------------------------
-    def _pick_save(self, line: QLineEdit, default: Path) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "保存为", str(default), "Excel 文件 (*.xlsx)")
-        if path:
-            line.setText(path)
+    # -- ③④⑤⑥ 文件选择 ------------------------------------------------------
+    def _pick_output_dir(self, line: QLineEdit, default: Path) -> None:
+        """「浏览…」：给输出文件挑**存放目录**（文件名保持自动生成的那个）。
+
+        以前这几颗按钮是「另存为…」，弹保存对话框逼用户起文件名 —— 可名字本来
+        就按店铺名自动填好了，多这一步纯粹碍事；用户真正想改的几乎总是「存到哪个
+        文件夹」。所以改成只选目录：**文件名原样保留**，只换它前面的目录部分。
+        想连文件名一起改，直接在输入框里敲完整路径即可（框本来就可编辑）。
+
+        起始目录优先用**上次选过的那个**，所以想把几个文件都收进同一个文件夹时，
+        第一下选好，后面几个点开就是对的目录，直接确定。
+        """
+        cur = Path(line.text().strip() or str(default))
+        # 注意：`Path("")` 是 `.`、`is_dir()` 为真 —— 空串必须单独判，否则起始目录
+        # 会变成一个点，Qt 拿不到有效位置。
+        start = dir_of(line.text().strip() or default)
+        if self._last_out_dir and Path(self._last_out_dir).is_dir():
+            start = Path(self._last_out_dir)
+        chosen = QFileDialog.getExistingDirectory(self, "选择存放目录", str(start))
+        if not chosen:
+            return
+        self._last_out_dir = chosen
+        new_path = Path(chosen) / cur.name
+        line.setText(str(new_path))
+        self.log_line(f"输出位置：{cur.name} → {new_path}")
 
     def _pick_customer_input(self) -> None:
         start = self.ed_cust_in.text().strip() or str(BASE_DIR)
@@ -1721,7 +2506,8 @@ class MainWindow(QMainWindow):
         self.cb_column.blockSignals(False)
 
     # -- ③④ 流水线 ----------------------------------------------------------
-    def _start_pipeline(self, do_orders: bool, do_customers: bool) -> None:
+    def _start_pipeline(self, do_orders: bool, do_customers: bool,
+                        do_rating: bool = False, do_bad: bool = False) -> None:
         self._load_config()
         if self.cfg is None:
             QMessageBox.warning(self, "未就绪", "找不到紫鸟项目，请先设置「紫鸟项目」路径。")
@@ -1736,12 +2522,41 @@ class MainWindow(QMainWindow):
 
         order_out = Path(self.ed_order_out.text().strip() or str(DEFAULT_ORDER_OUT))
         customer_out = Path(self.ed_cust_out.text().strip() or str(DEFAULT_CUSTOMER_OUT))
+        rating_out = Path(self.ed_rating_out.text().strip() or str(DEFAULT_RATING_OUT))
+        bad_out = Path(self.ed_bad_out.text().strip() or str(DEFAULT_BAD_CUSTOMER_OUT))
         cust_in_text = self.ed_cust_in.text().strip()
         cust_in = Path(cust_in_text) if cust_in_text else None
 
         if do_orders and order_out.suffix.lower() not in (".xlsx", ".xlsm"):
             order_out = order_out.with_suffix(".xlsx")
             self.ed_order_out.setText(str(order_out))
+        if do_rating and rating_out.suffix.lower() not in (".xlsx", ".xlsm"):
+            rating_out = rating_out.with_suffix(".xlsx")
+            self.ed_rating_out.setText(str(rating_out))
+        if do_bad and bad_out.suffix.lower() not in (".xlsx", ".xlsm"):
+            bad_out = bad_out.with_suffix(".xlsx")
+            self.ed_bad_out.setText(str(bad_out))
+        if do_bad and not do_rating:
+            # 单独跑⑥：必须有⑤导出的评分表（筛过的 out 或完整版 _评分原始，CSV 也认）
+            if not any(p.exists() for p in rating_file_candidates(rating_out)):
+                QMessageBox.warning(
+                    self, "找不到评分表",
+                    f"单独抓差评客户需要先有商品评分表：\n{rating_out}\n\n"
+                    "请先点「导出商品评分」，或在「评分 Excel」框里指向已有文件。")
+                return
+            # ★ 订单表**只在「评分文件里没有订单号列」时才必需**。
+            #   真机⑤导出的是带 order_id 的 CSV → ⑥ 拿订单号直接 order/get，
+            #   压根不碰订单表。旧版在这里无条件拦「找不到订单表」，用户明明
+            #   有评分表却被挡住（而且弹窗指着订单 Excel，看着像⑥读错了文件）。
+            if not rating_order_column(rating_out) \
+                    and not (Path(cust_in_text).exists() if cust_in_text else False) \
+                    and not order_out.exists():
+                QMessageBox.warning(
+                    self, "找不到订单表",
+                    f"评分文件里没有订单号列，只能靠买家昵称回订单表换出 Order ID，\n"
+                    f"但订单表不存在：\n{cust_in_text or order_out}\n\n"
+                    "请先执行「导出订单」，或在「订单 Excel」框里指向已有文件。")
+                return
         if do_customers:
             if customer_out.suffix.lower() not in (".xlsx", ".xlsm"):
                 customer_out = customer_out.with_suffix(".xlsx")
@@ -1756,8 +2571,12 @@ class MainWindow(QMainWindow):
         opts = {
             "do_orders": do_orders,
             "do_customers": do_customers,
+            "do_rating": do_rating,
+            "do_bad": do_bad,     # ⑥ 可以单独跑（读已有的评分 Excel）
             "order_out": str(order_out),
             "customer_out": str(customer_out),
+            "rating_out": str(rating_out),
+            "bad_out": str(bad_out),
             "customer_input": str(cust_in) if cust_in else "",
             "customer_sheet": self.cb_sheet.currentText().strip(),
             "order_column": self.cb_column.currentText().strip() or "Order ID",
@@ -1769,10 +2588,9 @@ class MainWindow(QMainWindow):
             "api_base": tc.DEFAULT_API_BASE,
             "page_origins": "",
             "seller_id": "",
+            "target_shop": self.cb_shop.currentText().strip() or DEFAULT_TARGET_SHOP,
             "transport_mode": DEFAULT_TRANSPORT_MODE,
             "skip_ip_check": self.chk_skip_ip.isChecked(),
-            # 店铺浏览器窗口是否可见（0=可见，1=无头）
-            "headless": 0 if self.chk_visible.isChecked() else 1,
         }
 
         self._set_busy("pipe")
@@ -1782,10 +2600,15 @@ class MainWindow(QMainWindow):
             self.tbl_orders.setRowCount(0)
         if do_customers:
             self.tbl_customers.setRowCount(0)
+        if do_rating:
+            self.tbl_rating.setRowCount(0)
+        if do_bad:
+            self.tbl_bad.setRowCount(0)
+        steps = [s for s, on in (("导出订单", do_orders), ("抓客户信息", do_customers),
+                                 ("导出商品评分", do_rating),
+                                 ("抓差评客户", do_bad)) if on]
         self.log_line("=" * 60)
-        self.log_line(f"开始流水线：{'导出订单' if do_orders else ''}"
-                      f"{' + ' if do_orders and do_customers else ''}"
-                      f"{'抓客户信息' if do_customers else ''}"
+        self.log_line(f"开始流水线：{' + '.join(steps) or '(无步骤)'}"
                       f"　店铺={store.get('browserName') or '?'}")
 
         self.worker = PipelineThread(self.cfg, self.ed_root.text().strip(), store, opts, self)
@@ -1793,8 +2616,12 @@ class MainWindow(QMainWindow):
         self.worker.stage.connect(self._on_stage)
         self.worker.order_progress.connect(self._on_order_progress)
         self.worker.customer_progress.connect(self._on_customer_progress)
+        self.worker.rating_progress.connect(self._on_rating_progress)
         self.worker.orders_ready.connect(self._on_orders_ready)
         self.worker.customer_row.connect(self._on_customer_row)
+        self.worker.rating_ready.connect(self._on_rating_ready)
+        self.worker.bad_progress.connect(self._on_bad_progress)
+        self.worker.bad_ready.connect(self._on_bad_ready)
         self.worker.done.connect(self._on_pipeline_done)
         self.worker.failed.connect(self._on_pipeline_failed)
         self.worker.start()
@@ -1814,24 +2641,67 @@ class MainWindow(QMainWindow):
         self.bar_progress.setValue(done)
         self.lbl_stat.setText(f"客户信息：{done}/{total}")
 
+    def _on_rating_progress(self, got: int, total: int) -> None:
+        self.bar_progress.setRange(0, 0)
+        if total:
+            self.bar_progress.setRange(0, total)
+            self.bar_progress.setValue(min(got, total))
+        self.lbl_stat.setText(f"商品评分：{got}" + (f" / {total}" if total else ""))
+
+    def _on_bad_progress(self, got: int, total: int) -> None:
+        self.bar_progress.setRange(0, max(1, total))
+        self.bar_progress.setValue(got)
+        self.lbl_stat.setText(f"差评客户：{got}/{total}")
+
+    def _on_bad_ready(self, rows: list) -> None:
+        """⑥ 差评客户表：客户列 + 评分 + 商品（列固定，不随导出文件变）。"""
+        if not rows:
+            self._fill_table(self.tbl_bad, [dict.fromkeys(BAD_CUSTOMER_COLUMNS, "")])
+            self.log_line("没有可写入的差评客户")
+            return
+        shown = self._fill_table(self.tbl_bad, rows)
+        self.tabs.setCurrentWidget(self.tbl_bad)
+        if shown:
+            self.log_line(f"差评客户表格只显示前 {shown} 行，"
+                          f"完整 {len(rows)} 行见导出的 Excel")
+
     def _on_orders_ready(self, rows: list) -> None:
         """订单表按导出文件自己的表头重建列（导出文件 60+ 列，与内置列名不同）。"""
-        cols: list[str] = list(rows[0].keys()) if rows else list(tc.ORDER_COLUMNS)
+        if not rows:        # 空结果也要建出列，不然表格还是上一批的旧列
+            rows = []
+        shown = self._fill_table(self.tbl_orders, rows)
+        if not rows:
+            self._fill_table(self.tbl_orders, [dict.fromkeys(tc.ORDER_COLUMNS, "")])
+        if shown:
+            self.log_line(f"表格只显示前 {shown} 行，完整 {len(rows)} 行见导出的 Excel")
+        self.tabs.setCurrentWidget(self.tbl_orders)
+
+    def _on_rating_ready(self, rows: list) -> None:
+        """商品评分表按导出文件自己的表头建列（列数与订单完全不同）。"""
+        shown = self._fill_table(self.tbl_rating, rows)
+        if rows:
+            self.tabs.setCurrentWidget(self.tbl_rating)
+        if shown:
+            self.log_line(f"商品评分表格只显示前 {shown} 行，完整 {len(rows)} 行见导出的 Excel")
+
+    @staticmethod
+    def _fill_table(table: Any, rows: list) -> None:
+        cols: list[str] = list(rows[0].keys()) if rows else []
         shown = rows[:MAX_TABLE_ROWS]
-        self.tbl_orders.setUpdatesEnabled(False)
+        table.setUpdatesEnabled(False)
         try:
-            self.tbl_orders.clear()
-            self.tbl_orders.setColumnCount(len(cols))
-            self.tbl_orders.setHorizontalHeaderLabels(cols)
-            self.tbl_orders.setRowCount(len(shown))
+            table.clear()
+            table.setColumnCount(len(cols))
+            table.setHorizontalHeaderLabels(cols)
+            table.setRowCount(len(shown))
             for r, row in enumerate(shown):
                 for c, col in enumerate(cols):
-                    self.tbl_orders.setItem(r, c, QTableWidgetItem(str(row.get(col, ""))))
+                    table.setItem(r, c, QTableWidgetItem(str(row.get(col, ""))))
         finally:
-            self.tbl_orders.setUpdatesEnabled(True)
+            table.setUpdatesEnabled(True)
         if len(rows) > len(shown):
-            self.log_line(f"表格只显示前 {len(shown)} 行，完整 {len(rows)} 行见导出的 Excel")
-        self.tabs.setCurrentWidget(self.tbl_orders)
+            return len(shown)
+        return None
 
     def _on_customer_row(self, idx: int, row: dict) -> None:
         if idx < 0:
@@ -1850,6 +2720,10 @@ class MainWindow(QMainWindow):
             parts.append(f"订单 {summary.get('order_count', 0)} 条 → {summary['order_out']}")
         if summary.get("customer_out"):
             parts.append(f"客户 {summary.get('customer_count', 0)} 条 → {summary['customer_out']}")
+        if summary.get("rating_out"):
+            parts.append(f"商品评分 {summary.get('rating_count', 0)} 条 → {summary['rating_out']}")
+        if summary.get("bad_out"):
+            parts.append(f"差评客户 {summary.get('bad_count', 0)} 条 → {summary['bad_out']}")
         text = "；".join(parts) or "无输出"
         self.log_line(f"流水线完成：{text}")
         if summary.get("errors"):
@@ -1857,7 +2731,11 @@ class MainWindow(QMainWindow):
         if summary.get("stopped"):
             self.log_line("（用户中途停止）")
         self.lbl_stat.setText("完成")
-        if summary.get("customer_out"):
+        if summary.get("bad_out"):
+            self.tabs.setCurrentWidget(self.tbl_bad)
+        elif summary.get("rating_out"):
+            self.tabs.setCurrentWidget(self.tbl_rating)
+        elif summary.get("customer_out"):
             self.tabs.setCurrentWidget(self.tbl_customers)
         self.worker = None
 
@@ -1878,7 +2756,8 @@ class MainWindow(QMainWindow):
 
     # -- 其它 ---------------------------------------------------------------
     def _open_output_dir(self) -> None:
-        for text in (self.ed_cust_out.text().strip(), self.ed_order_out.text().strip()):
+        for text in (self.ed_cust_out.text().strip(), self.ed_order_out.text().strip(),
+                     self.ed_rating_out.text().strip(), self.ed_bad_out.text().strip()):
             p = Path(text)
             if p.parent.exists():
                 reveal_path(p.parent)
@@ -1896,7 +2775,14 @@ class MainWindow(QMainWindow):
             f"接口主机       : {tc.DEFAULT_API_BASE}",
             f"订单输出       : {self.ed_order_out.text().strip()}",
             f"客户输出       : {self.ed_cust_out.text().strip()}",
-            f"订单列数/客户列数: {len(tc.ORDER_COLUMNS)} / {len(tc.CUSTOMER_COLUMNS)}",
+            f"商品评分输出   : {self.ed_rating_out.text().strip()}",
+            f"差评客户输出   : {self.ed_bad_out.text().strip()}",
+            f"评分页         : {te.rating_page_suffix('https://seller.us.')}",
+            "⑤/⑥           : 两颗独立按钮，可分开单独执行",
+            f"后台店铺       : {self.cb_shop.currentText().strip() or '(未设置)'}"
+            f"  →  {te.shop_home_url(self.cb_shop.currentText()) or '(认不出，不会导航)'}",
+            f"订单列/客户列/差评列: {len(tc.ORDER_COLUMNS)} / "
+            f"{len(tc.CUSTOMER_COLUMNS)} / {len(BAD_CUSTOMER_COLUMNS)}",
         ]
         QMessageBox.information(self, "环境自检", "\n".join(lines))
         for line in lines:

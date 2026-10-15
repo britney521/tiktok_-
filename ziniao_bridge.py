@@ -144,6 +144,14 @@ class ZiniaoBridgeError(RuntimeError):
     """桥接层自身的错误（找不到项目、连不上浏览器等）。"""
 
 
+class ZiniaoTimeout(ZiniaoBridgeError):
+    """页面请求等超时了 —— 典型是被验证码 hold 住（请求发出后才弹的那种）。
+
+    单独分一类，是因为它**不该在原层重试**：墙就立在那里，重试还是同样的结果。
+    交给上层「先过验证码再重试这一单」才有意义。
+    """
+
+
 # ----------------------------------------------------------------------------
 # DrissionPage 异常分类：掉线要重连，JS 自身报错不能重连
 # ----------------------------------------------------------------------------
@@ -696,41 +704,19 @@ class BrowserSession:
         except Exception:
             return False
 
-    def bring_to_front(self) -> bool:
-        """把店铺浏览器窗口还原并置前（最小化了/被别的窗口盖住时尤其有用）。
-
-        背景：紫鸟的 **客户端主程序** 在 ``--run_type=web_driver`` 下必然无界面
-        （官方语义就是「让超级浏览器以无界面状态运行主进程」），这个改不了 ——
-        去掉该参数就没有 HTTP IPC 端口。但**店铺浏览器窗口是真实的 Chromium
-        窗口**，只要 ``isHeadless=0`` 就会弹出来，看的到 TikTok 后台页面。
-        这里只负责把它从「最小化 / 被遮挡」状态拉回前台。
-        两层都失败也不抛异常（老内核未必支持 ``Browser.*`` 域）。
-        """
-        ok = False
-        try:
-            self.call("Page.bringToFront", {}, timeout=5, retry=False)
-            ok = True
-        except Exception as exc:
-            self.log(f"Page.bringToFront 失败：{type(exc).__name__}: {exc}")
-        try:
-            win = self.call("Browser.getWindowForTarget",
-                            {"targetId": self._target_id}, timeout=5, retry=False)
-            wid = (win or {}).get("windowId")
-            if wid is not None:
-                self.call("Browser.setWindowBounds",
-                          {"windowId": wid, "bounds": {"windowState": "normal"}},
-                          timeout=5, retry=False)
-                ok = True
-        except Exception as exc:
-            self.log(f"窗口还原不可用（{type(exc).__name__}），只做了置前")
-        return ok
-
     # -- CDP 调用 ----------------------------------------------------------
     def call(self, method: str, params: dict[str, Any] | None = None,
              timeout: float | None = None, retry: bool = True) -> Any:
         """发一条 CDP 命令并等它的响应（自动跳过事件消息）。
 
         连接层异常时重连并重放一次（两个业务接口都是读操作，重放安全）。
+
+        ★ ``timeout`` 是**总时限**，不是「单次 recv 的等待」★
+        2026-10-15 真机定案：这条连接在等响应期间会不停推事件（``Network.*`` /
+        ``Fetch.*`` …）。旧写法每收到一条事件就重新 ``recv`` 一次，「单次超时」
+        被无限续命 —— 一旦页面里有请求被验证码 hold 住（实测：验证码挂着时新发
+        的 ``order/get`` 14s+ 不返回），这里就**永远不返回**：流水线看着像卡死、
+        日志停止增长、CPU 却在空转。现在按墙上时钟判定，到点必抛。
         """
         ws = self._ws
         if ws is None:
@@ -739,17 +725,30 @@ class BrowserSession:
         self._req_id += 1
         mid = self._req_id
         prev = ws.gettimeout()
-        if timeout:
-            ws.settimeout(float(timeout))
+        deadline = (time.time() + float(timeout)) if timeout else None
         try:
             ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
             while True:
+                if deadline is not None:
+                    left = deadline - time.time()
+                    if left <= 0:
+                        raise TimeoutError(
+                            f"{method} 等响应超过 {timeout}s（期间只收到事件消息）")
+                    ws.settimeout(max(0.2, left))
                 msg = json.loads(ws.recv())
                 if msg.get("id") == mid:
                     if "error" in msg:
                         raise RuntimeError(f"{method}: {msg['error']}")
                     return msg.get("result")
         except Exception as exc:
+            # 到点了的 socket 超时 = 真·超时，不是断线 —— 别拿去触发重连重试
+            # （否则「重连 → 再等满一轮 → 再重连」把 120s 变成几分钟）
+            if deadline is not None and time.time() >= deadline - 0.05 \
+                    and _is_ws_error(exc):
+                raise TimeoutError(
+                    f"{method} 等响应超过 {timeout}s（期间只收到事件消息）") from exc
+            if isinstance(exc, TimeoutError):
+                raise
             if retry and _is_ws_error(exc):
                 self.log(f"CDP 连接中断（{type(exc).__name__}），重连后重试 {method}")
                 self.reconnect()
@@ -1470,6 +1469,14 @@ class BrowserTransport:
         self._first_logged = ""
         # 这些码说明「这次请求发得不对」—— 换写法再试（页面来源换过了就换 host）
         self.retry_codes = {str(c) for c in blocked_codes} | PERMISSION_CODES
+        # ★ 等响应期间的验证码闸门（可选）★
+        # 验证码是**请求发出去之后**才弹的，还会把这条请求一直 hold 住。挂上
+        # ``wait_hook`` 后，等待期间每隔一会儿调它一次（返回 True = 刚处理完验证码，
+        # 计时重来一轮）。不挂 = 老行为（一次 awaitPromise 死等）。
+        self.wait_hook: Any = None
+        # 单次请求的**总时限**（秒）。正常 order/get 是 1~2s，60s 已经非常宽松；
+        # 到点就报错交给上层重试，好过被验证码挂到天荒地老。
+        self.wait_timeout: float = 60.0
 
     @property
     def tab(self):
@@ -1681,11 +1688,78 @@ class BrowserTransport:
             "})()"
         )
 
+    # 等响应用：结果先写进页面上这个变量，Python 侧再轮询取回
+    WAIT_SLOT = "__tk_async_call"
+
+    def _eval(self, script: str, timeout: float = 20.0) -> Any:
+        """只读地跑一段 JS（不 await Promise）。"""
+        fn = getattr(self._browser, "eval", None)
+        if callable(fn):
+            return fn(script, await_promise=False, timeout=timeout)
+        return self.tab.run_js(script, as_expr=True, timeout=timeout)
+
     def _run(self, script: str) -> Any:
-        runner = getattr(self._browser, "run_js", None)
-        if callable(runner):
-            return runner(script, timeout=120)
-        return self.tab.run_js(script, as_expr=True, timeout=120)
+        if self.wait_hook is None:          # 没挂闸门 → 老路（一次 awaitPromise）
+            runner = getattr(self._browser, "run_js", None)
+            if callable(runner):
+                return runner(script, timeout=self.wait_timeout)
+            return self.tab.run_js(script, as_expr=True, timeout=self.wait_timeout)
+        return self._run_watchful(script)
+
+    def _run_watchful(self, script: str) -> Any:
+        """发请求但**不在 CDP 里死等**，改成「页面立刻返回 + Python 轮询结果」。
+
+        ★ 为什么必须这样（2026-10-15 真机）★
+        验证码是**请求发出去之后**由服务端触发的，而且会把这条请求一直 hold 住
+        （实测：验证码挂着时新发的 ``order/get`` 14s+ 不返回）。用 ``awaitPromise``
+        死等 = 整个抓取卡在那一单上，验证码也永远不会被处理（闸门在请求**之前**
+        跑，那时还没验证码）。
+        现在把结果写进 ``window[WAIT_SLOT]``、页面立刻返回，Python 侧每 0.35s 看
+        一眼状态；**等超过 2s 还没回就顺手过一次验证码**（``wait_hook``），过了
+        就把计时重来一轮，让被放行的请求有机会返回。
+        """
+        slot = self.WAIT_SLOT
+        armed = (
+            "(() => {"
+            f"window.{slot} = {{state:'pending', t:Date.now()}};"
+            "(async () => {"
+            "  try {"
+            f"    const v = await ({script});"
+            f"    window.{slot} = {{state:'done', value:v,"
+            f"                    ms:Date.now()-window.{slot}.t}};"
+            "  } catch (e) {"
+            f"    window.{slot} = {{state:'error', error:String(e),"
+            f"                    ms:Date.now()-window.{slot}.t}};"
+            "  }"
+            "})();"
+            "return 'armed';"
+            "})()"
+        )
+        self._eval(armed)
+        started = time.time()
+        deadline = started + float(self.wait_timeout)
+        while True:
+            if time.time() > deadline:
+                raise ZiniaoTimeout(
+                    f"页面请求 {self.wait_timeout:.0f}s 没返回"
+                    "（被验证码挂起了？）")
+            time.sleep(0.35)
+            # pending 时只读状态（别把几万字节的响应体每次拉回来）
+            state = str(self._eval(
+                f"(window.{slot} && window.{slot}.state) || ''") or "")
+            if state == "done":
+                return self._eval(f"String(window.{slot}.value)", timeout=60)
+            if state == "error":
+                err = str(self._eval(f"String((window.{slot}||{{}}).error)") or "")
+                raise ZiniaoBridgeError(f"页面 fetch 异常：{err}")
+            # 正常请求 1~2s 就回来了；超过 2s 还没回，多半是验证码在拦 —— 过掉它
+            if self.wait_hook and time.time() - started > 2.0:
+                try:
+                    if self.wait_hook():
+                        self.log("[验证码] 已处理，继续等这条被挂起的请求")
+                        deadline = time.time() + float(self.wait_timeout)
+                except Exception:
+                    pass
 
     # -- 单次请求 -----------------------------------------------------------
     def _once(self, full: str, body: dict[str, Any] | None) -> dict[str, Any]:

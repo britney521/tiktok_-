@@ -85,8 +85,11 @@ DETAIL_AID = "4068"     # order/get 用这个（detail.py 实测可通）
 LIST_AID = "6556"       # order/list 用这个（list.py 抓到的后台真实请求）
 
 # 客户信息导出的列（顺序即写表顺序）
+# 「SKU ID」= 商品 SKU 的平台 ID（``sku_module[].sku_id``）。
+# 主源是接口响应本身；订单表那条路只是兜底（见 ``read_sku_map``）。
 CUSTOMER_COLUMNS: list[str] = [
     "Order ID",
+    "SKU ID",
     "Buyer Nickname",
     "Recipient",
     "First Name",
@@ -138,6 +141,19 @@ ORDER_COLUMNS: list[str] = [
 ]
 
 TransportFn = Callable[[str, dict | None, dict | None], dict[str, Any]]
+
+# 兜底来源：订单表里「商品 SKU 的平台 ID」可能的列名（随后台语言/版本变），
+# 按优先级取第一个命中的。注意**不是**「Seller SKU」（那是商家自定义编码）。
+SKU_SOURCE_COLUMNS: tuple[str, ...] = ("SKU ID", "商品 SKU", "商品SKU", "Sku ID")
+# 接口响应里 sku 节点的字段名：只要**平台 SKU ID**
+SKU_ID_KEYS: tuple[str, ...] = ("sku_id", "skuid", "id")
+# 一个订单多个 SKU 时的分隔符
+SKU_JOIN = " | "
+
+
+def norm_col(name: Any) -> str:
+    """列名归一化：去空格、连字符、下划线后转小写。"""
+    return str(name or "").strip().lower().replace(" ", "").replace("-", "").replace("_", "")
 
 
 class ApiError(RuntimeError):
@@ -366,6 +382,11 @@ class OrderClient:
                 raise
             except Exception as exc:  # 网络 / 解析异常 → 重试
                 last_exc = exc
+                # ★ 页面请求超时（多一半是验证码把请求挂住了）**不在这里重试** ★
+                # 墙没拆掉，重试只是把 60s 变成 3×60s。交给上层「先过验证码、
+                # 再重试这一单」。按类名判断，免得为这一个判断反向依赖桥接层。
+                if type(exc).__name__ == "ZiniaoTimeout":
+                    raise ApiError("timeout", str(exc)) from exc
                 if attempt < self.retries:
                     time.sleep(self.retry_delay)
         raise ApiError("network", f"{type(last_exc).__name__}: {last_exc}")
@@ -582,8 +603,50 @@ def _addr_items(shipping_address: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def parse_customer(main_order: dict[str, Any]) -> dict[str, str]:
-    """从单条 main_order 里抽出客户信息，缺失字段填空串。"""
+def _sku_ids_from_order(main_order: dict[str, Any]) -> str:
+    """从 order/get 的响应里取**商品 SKU 的平台 ID**（``sku_module[].sku_id``）。
+
+    这是客户表「SKU ID」列的**主源**：请求本身就是按 Order ID 打的，响应里带着
+    这一单的 sku 列表，不用再回订单表关联。
+
+    注意不要拿 ``seller_sku_name`` 顶上：那是商家自己填的编码，和平台 SKU ID
+    是两回事。取不到就返回空串（由订单表兜底），不猜。
+    """
+    node = main_order.get("sku_module")
+    if node is None:
+        node = main_order.get("sku_list")
+    if isinstance(node, dict):
+        node = node.get("sku_list") or node.get("skus") or [node]
+    if not isinstance(node, list):
+        return ""
+    found: list[str] = []
+    for item in node:
+        if not isinstance(item, dict):
+            continue
+        for key in SKU_ID_KEYS:
+            val = item.get(key)
+            if val:
+                found.append(str(val))
+                break
+    return join_skus(found)
+
+
+def join_skus(values: Sequence[Any], sep: str = SKU_JOIN) -> str:
+    """同一订单多个 SKU 合成一格：去重保序。"""
+    out: list[str] = []
+    for v in values or []:
+        text = str(v or "").strip()
+        if text and text.lower() != "none" and text not in out:
+            out.append(text)
+    return sep.join(out)
+
+
+def parse_customer(main_order: dict[str, Any], sku_ids: str = "") -> dict[str, str]:
+    """从单条 main_order 里抽出客户信息，缺失字段填空串。
+
+    :param sku_ids: 兜底用的 SKU ID（由订单表按 Order ID 关联而来），
+        只在响应里没有 sku 节点时顶上
+    """
     bim = main_order.get("buyer_info_module") or {}
     addr = bim.get("shipping_address") or {}
     items = _addr_items(addr)
@@ -595,6 +658,7 @@ def parse_customer(main_order: dict[str, Any]) -> dict[str, str]:
 
     return {
         "Order ID": str(main_order.get("main_order_id") or ""),
+        "SKU ID": _sku_ids_from_order(main_order) or sku_ids,
         "Buyer Nickname": str(bim.get("buyer_nickname") or ""),
         "Recipient": items.get("name", ""),
         "First Name": items.get("first_name", ""),
@@ -614,10 +678,14 @@ def parse_customer(main_order: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def blank_customer(order_id: str, status: str) -> dict[str, str]:
-    """请求失败时的占位行，保证输出行数与原表一致。"""
+def blank_customer(order_id: str, status: str, sku_ids: str = "") -> dict[str, str]:
+    """请求失败时的占位行，保证输出行数与原表一致。
+
+    接口没回来的那些行，SKU ID 由订单表按 Order ID 补上（便于拿它回订单表核对）。
+    """
     row = {col: "" for col in CUSTOMER_COLUMNS}
     row["Order ID"] = str(order_id)
+    row["SKU ID"] = sku_ids
     row["Fetch Status"] = status
     return row
 
@@ -694,13 +762,50 @@ def read_order_ids(path: Path | str, sheet: str | None = None,
     return result
 
 
+def read_sku_map(path: Path | str, sheet: str | None = None,
+                 order_column: str = "Order ID",
+                 sku_columns: Sequence[str] = SKU_SOURCE_COLUMNS,
+                 ) -> dict[str, str]:
+    """从订单表读「Order ID → 商品 SKU 的 SKU ID」映射（**兜底用**）。
+
+    主源是接口响应里的 ``sku_module``，只有那条路拿不到（或是请求失败的占位行）
+    才用这张表补。一个订单可能有多行（多个 SKU）→ 合成一格；表里的字段说明行
+    第 1 列不是数字，按最后的数字校验天然会被跳过。表里没有 SKU ID 列时返回
+    空 dict（调用方据此提示，不该当作错误中断流水线）。
+    """
+    rows = iter_sheet_rows(path, sheet)
+    if not rows:
+        return {}
+
+    o_row, o_col = _locate_column(rows, order_column)
+    s_col = -1
+    for name in sku_columns:
+        try:
+            _, s_col = _locate_column(rows, name)
+            break
+        except ValueError:
+            continue
+    if s_col < 0:
+        return {}
+
+    parts: dict[str, list[str]] = {}
+    for row in rows[o_row + 1 :]:
+        if max(o_col, s_col) >= len(row):
+            continue
+        oid = str(row[o_col] or "").strip()
+        if not oid.isdigit() or len(oid) < 10:   # 说明行 / 空行 / 表尾
+            continue
+        parts.setdefault(oid, []).append(row[s_col])
+    return {oid: join_skus(vals) for oid, vals in parts.items()}
+
+
 def _locate_column(rows: list[tuple], column: str) -> tuple[int, int]:
-    target = column.strip().lower().replace(" ", "")
+    target = norm_col(column)
     for r, row in enumerate(rows):
         for c, cell in enumerate(row):
             if cell is None:
                 continue
-            if str(cell).strip().lower().replace(" ", "") == target:
+            if norm_col(cell) == target:
                 return r, c
     raise ValueError(f"未找到列：{column}")
 

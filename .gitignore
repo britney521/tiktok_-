@@ -34,13 +34,26 @@ dist/
 release/
 # 注意：build.spec 是要提交的，别加 "*.spec"
 
-# --- 导出的订单 / 客户表（含客户姓名、地址、电话等隐私）---
+# --- 导出的订单 / 客户 / 评分表（含客户姓名、地址、电话等隐私）---
 *_订单.xlsx
 *_客户.xlsx
 订单.xlsx
 客户.xlsx
 全部 笔订单-*.xlsx
 _导出原始.xlsx
+# ⑤⑥ 的产物同样带客户痕迹（评分 CSV 里有 order_id / product_id，差评表里有收货信息）
+*_商品评分.xlsx
+*_客户差评信息.xlsx
+_评分原始.*
+商品评分.xlsx
+客户差评信息.xlsx
+# WPS / Excel 打开文件时留下的锁文件
+.~*.xlsx
+~$*.xlsx
+
+# --- 验证码求解的现场图片（devtools 探针 / 求解器落盘，含验证码截图，没必要入库）---
+devtools/_captcha_dump/
+_captcha_dump/
 
 # --- 本机临时文件 ---
 .DS_Store

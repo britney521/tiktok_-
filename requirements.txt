@@ -9,3 +9,9 @@ websocket-client>=1.7
 # 两重「静态分析看不见」——打包 exe 时如果不显式声明，会漏进包，
 # 打出来的程序一读配置就 ModuleNotFoundError: No module named 'yaml'。
 PyYAML>=6.0
+
+# 【验证码自动处理】captcha_solver.py：拼图缺口识别（cv2）+ ddddocr 兜底。
+# 两者都在函数内延迟 import，平时不装也不影响 GUI 启动，但装上才能自动过验证码。
+numpy>=1.26
+opencv-python>=4.9
+ddddocr>=1.5

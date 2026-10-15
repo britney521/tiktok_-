@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 # 这个脚本全程 print 中文。Windows 控制台默认 cp1252，不切编码就 UnicodeEncodeError
@@ -36,6 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import ziniao_bridge as zb  # noqa: E402
+import tiktok_client as tc  # noqa: E402  （第 10f 组要验 API 层对超时的处置）
 
 GEN = "https://seller.tiktokshopglobalselling.com"
 EU = "https://seller.eu.tiktokshopglobalselling.com"
@@ -146,6 +148,90 @@ class _ScriptedSession(zb.BrowserSession):
     def eval(self, script: str, await_promise: bool = True,
              timeout: float = 120):  # noqa: ARG002
         return self._ready
+
+
+class FakeWatchBrowser(FakeBrowser):
+    """带 ``eval`` 的假浏览器 —— 测「不 await、改轮询页面变量」那条新路。
+
+    ``window.__tk_async_call`` 的状态机由构造参数控制：
+
+      · ``done_after`` —— 第几次轮询时变 ``done``（页面请求返回了）
+      · ``stuck``      —— 永远 ``pending``（= 被验证码挂住，把请求 hold 死）
+      · ``err``        —— 变 ``error``（页面 fetch 自身抛错）
+    """
+
+    def __init__(self, url: str = US, done_after: int = 1,
+                 stuck: bool = False, err: str = "") -> None:
+        super().__init__(url)
+        self.done_after = done_after
+        self.stuck = stuck
+        self.err = err
+        self.arms = 0        # 布防次数
+        self.polls = 0       # 轮询次数
+        self.state = ""
+
+    def eval(self, script, await_promise=True, timeout=120):  # noqa: ARG002
+        slot = zb.BrowserTransport.WAIT_SLOT
+        if f"window.{slot} = {{" in script:                    # 布防（立刻返回）
+            self.arms += 1
+            self.state = "pending"
+            return "armed"
+        if f"window.{slot} && window.{slot}.state" in script:  # 读状态
+            self.polls += 1
+            if self.stuck:
+                return "pending"
+            if self.err:
+                self.state = "error"
+                return "error"
+            if self.polls >= self.done_after:
+                self.state = "done"
+            return self.state
+        if f"String(window.{slot}.value)" in script:           # 读值
+            return json.dumps({"status": 200, "text": json.dumps({"code": 0})})
+        if f"(window.{slot}||{{}}).error" in script:           # 读错误
+            return self.err or "boom"
+        return ""
+
+
+class FakeWS:
+    """假 CDP WebSocket：``recv`` 可以「一直只吐事件」（永远等不到本 id 的响应）。"""
+
+    def __init__(self, mode: str = "events") -> None:
+        self.mode = mode
+        self.sent: list[str] = []
+        self.timeout: float | None = None
+
+    def send(self, data):  # noqa: ARG002
+        self.sent.append(data)
+
+    def gettimeout(self):
+        return None
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def recv(self):
+        if self.mode == "reply":
+            mid = json.loads(self.sent[0])["id"]
+            return json.dumps({"id": mid, "result": {"ok": 1}})
+        time.sleep(0.02)
+        return json.dumps({"method": "Network.dataReceived", "params": {"x": 1}})
+
+
+class MiniSession:
+    """只借 ``BrowserSession.call`` 的骨架（不连调试端口）。"""
+
+    call = zb.BrowserSession.call
+
+    def __init__(self, ws: FakeWS) -> None:
+        self._ws = ws
+        self._req_id = 0
+        self.log = lambda _m: None
+        self.reconnects = 0
+
+    def reconnect(self):
+        self.reconnects += 1
+        return True
 
 
 def main() -> int:
@@ -337,6 +423,138 @@ def main() -> int:
     check("锁定组合 = 同源 @ us",
           t14.winner_label == "同源" and t14.winner_origin == US,
           f"{t14.winner_label} @ {t14.winner_origin}")
+
+    print("== 10. 请求等响应期间可以被验证码「打断」==")
+    # 背景（2026-10-15 真机）：验证码是**请求发出去之后**才弹的，而且会把这条
+    # 请求一直 hold 住（实测新请求 14s+ 不返回）。老写法用 awaitPromise 死等 =
+    # 整条流水线卡在那一单、验证码也永远不会被处理。
+    # 10a 没挂 wait_hook → 保持老路（一次 awaitPromise），不引入轮询
+    fb_a = FakeBrowser(US)
+    fb_a.ok = {H_API}          # 请求打在接口域上，假浏览器按 host 判「这个站能不能看」
+    ta = zb.BrowserTransport(fb_a, log=lambda _m: None)
+    ta._run(ta._js(ORDER_GET, None))
+    check("没挂 wait_hook → 老路 run_js（零行为变化）",
+          bool(fb_a.sent) and not hasattr(fb_a, "arms"), str(fb_a.sent[:1]))
+    check("老路仍然直连浏览器（没借页面变量槽）",
+          not hasattr(fb_a, "arms") and len(fb_a.sent) == 1, str(len(fb_a.sent)))
+
+    # 10b 请求很快回来 → 不该去惊动验证码闸门
+    fb_b = FakeWatchBrowser(US, done_after=1)
+    tb = zb.BrowserTransport(fb_b, log=lambda _m: None)
+    hooked_b: list[float] = []
+    tb.wait_hook = lambda: (hooked_b.append(time.time()), False)[1]
+    out_b = tb._run('(async()=>{return "x"})()')
+    check("从页面变量拿回原样的返回值",
+          isinstance(out_b, str) and json.loads(out_b).get("status") == 200,
+          str(out_b)[:80])
+    check("请求 1 轮就回来 → 不惊动验证码闸门（前 2s 不查）",
+          hooked_b == [], str(hooked_b))
+    check("布防 1 次 / 轮询 1 次",
+          fb_b.arms == 1 and fb_b.polls == 1,
+          f"arms={fb_b.arms} polls={fb_b.polls}")
+
+    # 10c 被挂住 → 等超 2s 才去处理验证码；hook 说「刚过完」→ 计时重来
+    fb_c = FakeWatchBrowser(US, done_after=10)          # 约 3.5s 才 done
+    tc_ = zb.BrowserTransport(fb_c, log=lambda _m: None)
+    hooked_c: list[float] = []
+
+    def _hook_c() -> bool:
+        hooked_c.append(time.time())
+        return True                                     # 「刚处理完验证码」
+    tc_.wait_hook = _hook_c
+    t0 = time.time()
+    out_c = tc_._run('(async()=>{return "x"})()')
+    dt_c = time.time() - t0
+    check("被挂住时自动去过验证码", len(hooked_c) >= 1, str(len(hooked_c)))
+    check("★ 处理完验证码后，被挂起的请求最终仍取回结果",
+          isinstance(out_c, str) and json.loads(out_c).get("status") == 200,
+          str(out_c)[:60])
+    check("在总时限内收尾", dt_c < tc_.wait_timeout, f"{dt_c:.1f}s")
+    check("前 2s 不查（别对正常请求白花时间）",
+          not hooked_c or hooked_c[0] - t0 >= 2.0,
+          f"{(hooked_c[0] - t0) if hooked_c else -1:.2f}s")
+
+    # 10d 页面 fetch 自身报错 → 如实上抛（别当成超时吞掉）
+    fb_d = FakeWatchBrowser(US, err="Failed to fetch")
+    td = zb.BrowserTransport(fb_d, log=lambda _m: None)
+    td.wait_hook = lambda: False
+    try:
+        td._run('(async()=>{return "x"})()')
+        err_d = None
+    except Exception as exc:  # noqa: BLE001
+        err_d = exc
+    check("页面 fetch 异常 → 抛错且带上原因",
+          err_d is not None and "Failed to fetch" in str(err_d), repr(err_d))
+
+    # 10e 一直 pending → 到总时限抛 ZiniaoTimeout（可被上层识别、不再原层重试）
+    fb_e = FakeWatchBrowser(US, stuck=True)
+    te_ = zb.BrowserTransport(fb_e, log=lambda _m: None)
+    te_.wait_timeout = 3.0
+    te_.wait_hook = lambda: False
+    t0 = time.time()
+    try:
+        te_._run('(async()=>{return "x"})()')
+        err_e = None
+    except Exception as exc:  # noqa: BLE001
+        err_e = exc
+    dt_e = time.time() - t0
+    check("挂死 → 抛 ZiniaoTimeout（不无限等）",
+          isinstance(err_e, zb.ZiniaoTimeout), f"{type(err_e).__name__}: {err_e}")
+    check("耗时贴近 wait_timeout", 2.5 < dt_e < 6.0, f"{dt_e:.1f}s")
+    check("日志里说清「被验证码挂起」",
+          "没返回" in str(err_e), str(err_e))
+
+    # 10f 超时不该在 API 层被重试（墙没拆，重试只是把 60s 变成 3×60s）
+    class _TimeoutTransport:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __call__(self, url, params, body):  # noqa: ARG002
+            self.n += 1
+            raise zb.ZiniaoTimeout("页面请求 60s 没返回（被验证码挂起了？）")
+
+    class _MiniClient:
+        _post = tc.OrderClient._post
+
+        def __init__(self, tp) -> None:
+            self.transport = tp
+            self.retries = 2
+            self.retry_delay = 0.0
+            self.session = None
+            self.cookies = {}
+            self.headers = {}
+            self.timeout = 1
+
+    tp_f = _TimeoutTransport()
+    cli_f = _MiniClient(tp_f)
+    try:
+        cli_f._post("u", {}, {})
+        err_f = None
+    except tc.ApiError as exc:
+        err_f = exc
+    check("超时 → ApiError(code=timeout)", err_f is not None
+          and str(err_f.code) == "timeout", repr(err_f))
+    check("★ 只在原层发 1 次（不把 60s 变 3×60s）", tp_f.n == 1, str(tp_f.n))
+    check("不算 fatal（不能让整批中止）", err_f is not None and not err_f.is_fatal,
+          str(err_f.is_fatal if err_f else None))
+
+    print("== 11. call() 的 timeout 是「总时限」（事件消息不能无限续命）==")
+    s1 = MiniSession(FakeWS("reply"))
+    r1 = s1.call("Runtime.evaluate", {}, timeout=2)
+    check("正常响应原样返回", r1 == {"ok": 1}, str(r1))
+
+    s2 = MiniSession(FakeWS("events"))
+    t0 = time.time()
+    try:
+        s2.call("Runtime.evaluate", {}, timeout=0.6)
+        err2 = None
+    except TimeoutError as exc:
+        err2 = exc
+    dt2 = time.time() - t0
+    check("只收到事件 → 到点抛超时（不再死等）", err2 is not None, repr(err2))
+    check("耗时贴近 timeout，没有被事件续命", 0.5 < dt2 < 2.0, f"{dt2:.2f}s")
+    check("★ 超时不算「连接中断」→ 不触发重连重试",
+          s2.reconnects == 0, str(s2.reconnects))
 
     print(f"\n合计 {OK} 项通过，{FAIL} 项失败")
     return 1 if FAIL else 0
