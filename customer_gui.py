@@ -373,8 +373,10 @@ class PipelineThread(QThread):
         self._bad_hit = False
         # ④ 抓过的客户行缓存 {Order ID: 行} —— ⑥ 直接复用，同一单不重复请求
         self._cust_cache: dict[str, dict[str, str]] = {}
-        # ④ 建好的 SKU ID 兜底表 {Order ID: SKU ID}（⑥ 直接用，不重读订单表）
+        # ④ 建好的 SKU 兜底表（⑥ 直接用，不重读订单表）：
+        #   平台 SKU ID →「SKU ID」列；商家自定义 SKU →「商家 SKU」列
         self._sku_map_cache: dict[str, str] = {}
+        self._seller_sku_cache: dict[str, str] = {}
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -827,20 +829,26 @@ class PipelineThread(QThread):
         return ids
 
     @staticmethod
-    def _sku_col_of(row: dict[str, str]) -> str:
-        """在导出行里找「商品 SKU 的 SKU ID」那一列的实际列名（平台各版本叫法不同）。"""
-        wanted = {tc.norm_col(c) for c in tc.SKU_SOURCE_COLUMNS}
+    def _sku_col_of(row: dict[str, str],
+                    columns: tuple[str, ...] | None = None) -> str:
+        """在导出行里找目标 SKU 列的实际列名（平台各版本叫法不同）。
+
+        ``columns`` 不传 = 「平台 SKU ID」那组别名；传
+        ``tc.SELLER_SKU_SOURCE_COLUMNS`` 就找「商家 SKU」那一列（``Seller SKU``）。
+        """
+        wanted = {tc.norm_col(c) for c in (columns or tc.SKU_SOURCE_COLUMNS)}
         for key in row.keys():
             if tc.norm_col(key) in wanted:
                 return str(key)
         return ""
 
     @classmethod
-    def _sku_map_from_rows(cls, rows: list[dict[str, str]]) -> dict[str, str]:
-        """把③刚导出的订单表折叠成 {Order ID: SKU ID}（一个订单多 SKU 合并）。"""
+    def _sku_map_from_rows(cls, rows: list[dict[str, str]],
+                           columns: tuple[str, ...] | None = None) -> dict[str, str]:
+        """把③刚导出的订单表折叠成 {Order ID: 某个 SKU 列}（一单多 SKU 合并）。"""
         parts: dict[str, list[str]] = {}
         for row in rows or []:
-            col = cls._sku_col_of(row)
+            col = cls._sku_col_of(row, columns)
             if not col:
                 return {}
             oid = str(row.get("Order ID") or "").strip()
@@ -851,15 +859,20 @@ class PipelineThread(QThread):
                 parts.setdefault(oid, []).append(val)
         return {oid: tc.join_skus(v) for oid, v in parts.items()}
 
-    def _load_sku_map(self, rows: list[dict[str, str]]) -> tuple[dict[str, str], str]:
-        """订单 ID → 商品 SKU 的 SKU ID（**兜底用**），返回 ``(映射, 来源说明)``。
+    def _load_sku_map(self, rows: list[dict[str, str]],
+                      columns: tuple[str, ...] | None = None,
+                      label: str = "SKU ID") -> tuple[dict[str, str], str]:
+        """订单 ID → 某个 SKU 列（**兜底用**），返回 ``(映射, 来源说明)``。
+
+        ``columns`` 默认是「平台 SKU ID」那组别名；传
+        ``tc.SELLER_SKU_SOURCE_COLUMNS`` 就改成读「商家 SKU」那列，其余逻辑一样
+        （两条路都是「响应优先、订单表兜底」）。``label`` 只用于日志措辞。
 
         主源是接口响应里的 ``sku_module``（请求本身就带着），这张表只负责两种情形：
           ① 响应里没有 sku 节点；② 请求失败/中止的占位行 —— 它们没有响应可用。
-        取的是**平台 SKU ID**，不是「Seller SKU」（商家自定义编码）。
         """
         if rows:
-            got = self._sku_map_from_rows(rows)
+            got = self._sku_map_from_rows(rows, columns)
             if got:
                 return got, "③导出的订单表"
         src = Path(self.opts.get("customer_input") or "")
@@ -867,14 +880,25 @@ class PipelineThread(QThread):
             try:
                 got = tc.read_sku_map(
                     src, self.opts.get("customer_sheet") or None,
-                    self.opts.get("order_column") or "Order ID")
+                    self.opts.get("order_column") or "Order ID",
+                    sku_columns=columns or tc.SKU_SOURCE_COLUMNS)
             except Exception as exc:  # SKU 是附加列，读不到不该中断抓客户
-                self.log.emit("[提示] 读取订单表 SKU ID 失败（忽略，该列留空）："
+                self.log.emit(f"[提示] 读取订单表 {label} 失败（忽略，该列留空）："
                               f"{type(exc).__name__}: {exc}")
                 got = {}
             if got:
                 return got, f"订单文件 {src.name}"
         return {}, ""
+
+    def _sku_pair(self, oid: str) -> tuple[str, str]:
+        """订单表兜底的两个 SKU 值：``(平台 SKU ID, 商家 SKU)``。
+
+        顺序就是 ``tc.parse_customer`` / ``tc.blank_customer`` 的
+        ``(sku_ids, seller_skus)`` 参数顺序，调用处直接 ``*self._sku_pair(oid)``。
+        响应里自带 sku 节点时，这两个值会被响应里的真实值盖掉。
+        """
+        return (self._sku_map_cache.get(oid, ""),
+                self._seller_sku_cache.get(oid, ""))
 
     def _heal_store_identity(self, browser: Any, client_obj: tc.OrderClient,
                              ids: list[str], cur_sid: str,
@@ -977,13 +1001,23 @@ class PipelineThread(QThread):
         self.log.emit(f"===== 抓取客户信息：{len(ids)} 条，间隔 {interval}s =====")
         self.customer_progress.emit(0, len(ids))
 
-        # SKU ID 兜底：接口响应优先，没响应的行（失败/中止）由订单表补齐
+        # SKU 兜底（两条路一样）：接口响应优先，没响应的行（失败/中止）由订单表补齐。
+        # 「SKU ID」= 平台 ID；「商家 SKU」= 商家自定义编码（Seller SKU），两者都要。
         sku_map, sku_src = self._load_sku_map(rows)
-        self._sku_map_cache = sku_map   # ⑥ 直接用，不重复读订单表
+        seller_map, seller_src = self._load_sku_map(
+            rows, tc.SELLER_SKU_SOURCE_COLUMNS, "商家 SKU")
+        self._sku_map_cache = sku_map          # ⑥ 直接用，不重复读订单表
+        self._seller_sku_cache = seller_map
         if sku_map:
             self.log.emit(f"SKU ID 兜底表已就绪：{len(sku_map)} 条（来源：{sku_src}）")
         else:
-            self.log.emit("[提示] 订单表里没有 SKU ID 列，SKU 只取接口响应里的值")
+            self.log.emit("[提示] 订单表里没有 SKU ID 列，SKU ID 只取接口响应里的值")
+        if seller_map:
+            self.log.emit(f"商家 SKU 兜底表已就绪：{len(seller_map)} 条"
+                          f"（来源：{seller_src}）")
+        else:
+            self.log.emit("[提示] 订单表里没有 Seller SKU 列，"
+                          "商家 SKU 只取接口响应里的值")
 
         # ★ 抓客户前必须把页面停回**订单页** ★
         # 2026-10-14 用户真机定案：同源 fetch 只在订单页上成立 —— 站选对了但页面
@@ -1029,7 +1063,7 @@ class PipelineThread(QThread):
                               f"{client_obj.seller_id}"
                               f"（{zb.store_name_of(client_obj.seller_id) or '未登记'}）")
             else:
-                results0 = {oid: tc.blank_customer(oid, "SKIPPED", sku_map.get(oid, ""))
+                results0 = {oid: tc.blank_customer(oid, "SKIPPED", *self._sku_pair(oid))
                             for oid in ids}
                 self.log.emit("")
                 self.log.emit("✖ 所有候选区域站都看不到这批订单，已中止抓客户"
@@ -1055,7 +1089,7 @@ class PipelineThread(QThread):
                 self.log.emit("已手动停止，写出已抓取的数据…")
                 break
             if fatal:  # 已判定是店铺/凭据问题：补齐占位行收工，不再发请求
-                row = tc.blank_customer(oid, "SKIPPED", sku_map.get(oid, ""))
+                row = tc.blank_customer(oid, "SKIPPED", *self._sku_pair(oid))
                 results[oid] = row
                 self.customer_row.emit(i, row)
                 self.customer_progress.emit(i + 1, len(ids))
@@ -1064,16 +1098,16 @@ class PipelineThread(QThread):
                 payload = client_obj.fetch([oid], chunk_size=1)
                 orders = ((payload.get("data") or {}).get("main_order")) or []
                 if not orders:
-                    row = tc.blank_customer(oid, "EMPTY", sku_map.get(oid, ""))
+                    row = tc.blank_customer(oid, "EMPTY", *self._sku_pair(oid))
                     fail += 1
                     self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 无数据返回")
                 else:
-                    row = tc.parse_customer(orders[0], sku_map.get(oid, ""))
+                    row = tc.parse_customer(orders[0], *self._sku_pair(oid))
                     ok += 1
                     self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → "
                                   f"{row.get('Buyer Nickname', '')} {row.get('Recipient', '')}")
             except tc.ApiError as exc:
-                row = tc.blank_customer(oid, "API_ERROR", sku_map.get(oid, ""))
+                row = tc.blank_customer(oid, "API_ERROR", *self._sku_pair(oid))
                 fail += 1
                 self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 失败：{exc}")
                 if exc.is_fatal and not fatal:
@@ -1093,7 +1127,7 @@ class PipelineThread(QThread):
                             orders = ((payload.get("data") or {}).get("main_order")) or []
                             if orders:
                                 row = tc.parse_customer(orders[0],
-                                                         sku_map.get(oid, ""))
+                                                         *self._sku_pair(oid))
                                 ok += 1
                                 fail -= 1
                                 self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → "
@@ -1101,7 +1135,7 @@ class PipelineThread(QThread):
                                               f"{row.get('Recipient', '')}")
                             else:
                                 row = tc.blank_customer(oid, "EMPTY",
-                                                          sku_map.get(oid, ""))
+                                                          *self._sku_pair(oid))
                         except Exception as exc2:
                             self.log.emit(f"   重试仍失败：{type(exc2).__name__}: {exc2}")
                     else:
@@ -1112,7 +1146,7 @@ class PipelineThread(QThread):
                         self.log.emit("请核对③里打开的店铺是否就是导出该订单表的店铺。")
                         self.log.emit("—" * 58)
             except Exception as exc:
-                row = tc.blank_customer(oid, "EXCEPTION", sku_map.get(oid, ""))
+                row = tc.blank_customer(oid, "EXCEPTION", *self._sku_pair(oid))
                 fail += 1
                 self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 异常："
                               f"{type(exc).__name__}: {exc}")
@@ -1308,13 +1342,21 @@ class PipelineThread(QThread):
         #   98001008）。⑤ 结束时页面还在 /product/rating 上。
         self._ensure_order_page(browser)
 
-        # 单独跑⑥时④没跑过，缓存是空的 —— 这里自己按订单表补一份
-        if not self._sku_map_cache and order_rows is not None:
-            self._sku_map_cache, _src = self._load_sku_map(list(order_rows))
-            if self._sku_map_cache:
-                self.log.emit(f"SKU ID 兜底表已就绪：{len(self._sku_map_cache)} 条"
-                              f"（来源：{_src}）")
-        sku_map = self._sku_map_cache or {}
+        # 单独跑⑥时④没跑过，缓存是空的 —— 这里自己按订单表补一份（两张表都补）
+        if not (self._sku_map_cache and self._seller_sku_cache) \
+                and order_rows is not None:
+            rows_l = list(order_rows)
+            if not self._sku_map_cache:
+                self._sku_map_cache, _src = self._load_sku_map(rows_l)
+                if self._sku_map_cache:
+                    self.log.emit(f"SKU ID 兜底表已就绪：{len(self._sku_map_cache)} 条"
+                                  f"（来源：{_src}）")
+            if not self._seller_sku_cache:
+                self._seller_sku_cache, _src2 = self._load_sku_map(
+                    rows_l, tc.SELLER_SKU_SOURCE_COLUMNS, "商家 SKU")
+                if self._seller_sku_cache:
+                    self.log.emit(f"商家 SKU 兜底表已就绪："
+                                  f"{len(self._seller_sku_cache)} 条（来源：{_src2}）")
         results: list[dict[str, str]] = []
         ok = fail = 0
         fatal = False
@@ -1327,7 +1369,7 @@ class PipelineThread(QThread):
                      "商品": str(rrow.get(product_col) or "") if product_col else ""}
             if fatal:
                 results.append(self._bad_row(
-                    tc.blank_customer(oid, "SKIPPED", sku_map.get(oid, "")), extra))
+                    tc.blank_customer(oid, "SKIPPED", *self._sku_pair(oid)), extra))
                 continue
             cached = self._cust_cache.get(oid)
             if cached:                       # ④ 已经抓过 —— 直接复用，不重复请求
@@ -1340,20 +1382,20 @@ class PipelineThread(QThread):
                     orders = ((payload.get("data") or {}).get("main_order")) or []
                     if orders:
                         results.append(self._bad_row(
-                            tc.parse_customer(orders[0], sku_map.get(oid, "")), extra))
+                            tc.parse_customer(orders[0], *self._sku_pair(oid)), extra))
                         ok += 1
                         self._cust_cache[oid] = results[-1]
                         self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → "
                                       f"{results[-1].get('Buyer Nickname', '')}")
                     else:
                         results.append(self._bad_row(
-                            tc.blank_customer(oid, "EMPTY", sku_map.get(oid, "")),
+                            tc.blank_customer(oid, "EMPTY", *self._sku_pair(oid)),
                             extra))
                         fail += 1
                         self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 无数据返回")
                 except tc.ApiError as exc:
                     results.append(self._bad_row(
-                        tc.blank_customer(oid, "API_ERROR", sku_map.get(oid, "")),
+                        tc.blank_customer(oid, "API_ERROR", *self._sku_pair(oid)),
                         extra))
                     fail += 1
                     self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 失败：{exc}")
@@ -1364,7 +1406,7 @@ class PipelineThread(QThread):
                                       f"剩下的 {len(pairs) - i - 1} 条不再请求。")
                 except Exception as exc:
                     results.append(self._bad_row(
-                        tc.blank_customer(oid, "EXCEPTION", sku_map.get(oid, "")),
+                        tc.blank_customer(oid, "EXCEPTION", *self._sku_pair(oid)),
                         extra))
                     fail += 1
                     self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 异常："

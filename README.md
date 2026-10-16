@@ -107,7 +107,8 @@ CSV，完整版按真实格式落盘成 `_评分原始.csv`，不会伪装成 xl
 评分表(1~3 星) → 文件里的 order_id → order/get → <店铺名>_客户差评信息.xlsx
 ```
 
-- 输出列 = 客户表那 18 列 **+ 「评分」+「商品」**；
+- 输出列 = 客户表那 19 列 **+ 「评分」+「商品」**（所以差评表里也能直接看到
+  是哪个 `商家 SKU` 吃的差评）；
 - 评分文件**没有 `order_id` 列**（老版本后台）时才退回老路：昵称(+商品) →
   订单表换出 Order ID（两级匹配：先「昵称+商品」精确锁定，锁不到再退回只用昵称）；
   这时候才需要订单表；
@@ -117,15 +118,22 @@ CSV，完整版按真实格式落盘成 `_评分原始.csv`，不会伪装成 xl
 
 ## ④ 客户信息
 
-从订单 Excel 的 `Order ID` 列逐条调 `order/get`（该接口本地直连就通），写 `<店铺名>_客户.xlsx`（18 列）。
+从订单 Excel 的 `Order ID` 列逐条调 `order/get`（该接口本地直连就通），写 `<店铺名>_客户.xlsx`（19 列）。
 
-**「SKU ID」列（第 2 列）= 商品 SKU 的**平台 ID**，不是商家自定义的 Seller SKU。**
+**第 2、3 列是同一件商品 SKU 的**两个 ID**（紧挨着放，正好对齐订单表里那两列）：**
 
-- **主源**：`order/get` 响应里的 `sku_module[].sku_id`（请求本身就带着，最准）；
-- **兜底**：响应里没有 sku 节点、或是请求失败/中止的占位行 → 按 `Order ID` 从订单表
-  的 `SKU ID` 列补（也认 `商品 SKU` / `Sku ID` 等别名，单独跑④时回读订单 Excel）；
+| 列 | 是什么 | 主源（`order/get` 响应） | 兜底（订单表） |
+| --- | --- | --- | --- |
+| `SKU ID`（第 2 列） | 商品 SKU 的**平台 ID**，如 `1732172945808462636` | `sku_module[].sku_id` | `SKU ID` 列（也认 `商品 SKU` / `Sku ID`） |
+| `商家 SKU`（第 3 列） | 商家自己填的 **Seller SKU**，如 `X004RIMEUV` / `WT-1` | `sku_module[].seller_sku_name` | `Seller SKU` 列（也认 `商家 SKU`） |
+
+- **两列各自择源**，不是捆绑的：响应里只给了一个就只补另一个（实测会这样），
+  一个都没有的行才两列都走订单表；
 - 一个订单多个 SKU → 合并成一格（` | ` 分隔、去重）；
-- **注意别拿 `Seller SKU` 列顶上**：那是商家自己填的编码，和平台 SKU ID 是两回事。
+- ★ **别把两列搞混**：「商品 SKU」是**平台 ID** 那一组的中文别名（后台语言不同时
+  出现），**不属于**商家 SKU 那组 —— 代码里两组别名刻意不重叠，
+  找不到 `Seller SKU` 列时宁可留空也不拿平台 ID 顶上（有回归锁着）；
+- 找不到 `Seller SKU` 列也不会中断：只提示一句，该列留空、照抓不误。
 
 **cookie 必须与订单同属一个店铺**（2026-10-13 实测）：一个店铺的登录态只能看它自己的订单。
 汉维2-圣诞树 cookie + 汉维订单 → `code=0`；换成嘉恒业订单 → `code=98001008 需要权限`
@@ -189,10 +197,10 @@ CSV，完整版按真实格式落盘成 `_评分原始.csv`，不会伪装成 xl
 ```bash
 python customer_gui.py            # 打开界面
 python customer_gui.py --check    # 离屏自检（构建界面，不联网）
-python devtools/test_customer_sku.py   # 客户表「SKU ID」回归（30 条断言，零依赖）
-python devtools/test_bad_review.py     # 差评链路回归（75 条断言：筛选 / order_id 直连 / 昵称反查兜底 / ⑥单独跑）
+python devtools/test_customer_sku.py   # 客户表两列 SKU 回归（58 条断言：平台 ID / 商家 SKU 各自择源，零依赖）
+python devtools/test_bad_review.py     # 差评链路回归（82 条断言：筛选 / order_id 直连 / 昵称反查兜底 / ⑥单独跑）
 python devtools/test_shop_switch.py    # 后台店铺回归（43 条断言：名字→URL 解析 / 已是目标不动 / 落错站如实报，零依赖）
-python devtools/test_rating_export.py  # 商品评分导出回归（52 条断言：异步任务 / CSV / 同源取字节）
+python devtools/test_rating_export.py  # 商品评分导出回归（57 条断言：异步任务 / CSV / 同源取字节）
 python devtools/test_client_kill.py    # 「强制关掉已开启的紫鸟」回归（27 条断言，零依赖）
 QT_QPA_PLATFORM=offscreen python devtools/smoke_gui.py   # 冒烟测试（桩化紫鸟，15 段，零网络，约 15s）
 python devtools/export_check.py 1  # 真机验证：用第 2 个店铺跑一遍完整导出
@@ -333,13 +341,14 @@ python devtools/capture_order_request.py --store 2 --probe-get 订单.xlsx
      右上角切换器只保留**只读**读取（把店铺名写进日志，读不到不影响流程）
 3. **选中店铺 → 导出订单**：打开订单页 → 点「导出」按钮 → 等生成 → 拦截 URL 取回文件，
    写 `<店铺名>_订单.xlsx`（列名 = 导出文件表头，全量保留），原始文件另存 `_导出原始.xlsx`
-4. **抓客户信息**：从订单 Excel 读 `Order ID` 列，逐条 `order/get`，写 `<店铺名>_客户.xlsx`（18 列，含取自响应 `sku_module` 的「SKU ID」）
+4. **抓客户信息**：从订单 Excel 读 `Order ID` 列，逐条 `order/get`，写 `<店铺名>_客户.xlsx`
+   （19 列，含取自响应 `sku_module` 的「SKU ID」和「商家 SKU」）
 5. **导出商品评分**：⑤ 区「导出商品评分」按钮，走 `/product/rating` 页自己的「导出」
    按钮；导出后**只留 1~3 星**并覆盖保存（完整版留 `_评分原始.xlsx`）。
    **只导评分、先不抓客户**就点这一颗
 6. **抓差评客户**：⑤ 区「抓取差评客户（1~3 星）」按钮，**可单独点**——读已有的评分
    表，取 1~3 星那批的**订单号**（真机评分文件自带 `order_id`），逐条 `order/get`，
-   写 `<店铺名>_客户差评信息.xlsx`（客户 18 列 + 「评分」「商品」）。
+   写 `<店铺名>_客户差评信息.xlsx`（客户 19 列 + 「评分」「商品」）。
    只有老版「仅昵称」的评分文件才需要订单表来换订单号
 
 > 输出文件名默认带店铺名（选中店铺后自动填入），一个店一份，不同店铺互不覆盖。
@@ -453,11 +462,13 @@ devtools/test_client_kill.py 「强制关掉所有紫鸟客户端」回归（27 
                         `zb._IS_WINDOWS` 换成假的 → 在 macOS 上断言 Windows 分支的
                         命令行内容与顺序（三种进程名全杀 / 先数再杀 / 杀不干净再来
                         一轮 / 异常不外抛）。**不碰本机进程**
-devtools/test_rating_export.py 商品评分导出回归测试（假 CDP 会话，52 条断言）
+devtools/test_rating_export.py 商品评分导出回归测试（假 CDP 会话，57 条断言）
 devtools/test_transport.py 「页面来源 × 写法」择路 + 超时处置回归测试
                         （51 条断言；第 10 组「超时不在原层重试」，第 11 组「事件不续命」）
-devtools/test_customer_sku.py 客户表「SKU ID」列回归测试（30 条断言：响应用 sku_id / 不拿 Seller SKU 顶 / 订单表兜底）
-devtools/test_bad_review.py 差评链路回归测试（75 条断言：1~3 星筛选 / 别名列名 / order_id 直连 / 昵称反查兜底 / ⑥单独跑）
+devtools/test_customer_sku.py 客户表两列 SKU 回归测试（58 条断言：「SKU ID」取响应的
+                        sku_id、「商家 SKU」取响应的 seller_sku_name；两列各自择源、
+                        订单表兜底、★「商品 SKU」列不算商家 SKU 命中）
+devtools/test_bad_review.py 差评链路回归测试（82 条断言：1~3 星筛选 / 别名列名 / order_id 直连 / 昵称反查兜底 / ⑥单独跑 / 差评表带商家 SKU）
 devtools/test_shop_switch.py 后台店铺回归测试（43 条断言：显示名/区域码/URL→后台 URL 解析、已是目标幂等、落错站回填实际 URL、导航失败不中断）
 devtools/live_shop_probe.py  真机探测脚本（连已开的店铺浏览器：现在在哪家店 + 目标会导航到哪个 URL；默认只读，--go 才真跳）
 devtools/test_windows_paths.py Windows 客户端定位回归测试（假文件系统，任何平台可跑）

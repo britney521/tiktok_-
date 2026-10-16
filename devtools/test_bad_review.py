@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import openpyxl  # noqa: E402
+import tiktok_client as tc  # noqa: E402
 import tiktok_export as te  # noqa: E402
 from customer_gui import (  # noqa: E402
     BAD_CUSTOMER_COLUMNS, PipelineThread,
@@ -177,8 +178,12 @@ def main() -> int:
     print("7) 差评客户表列")
     check("= 客户列 + 评分 + 商品",
           BAD_CUSTOMER_COLUMNS[-2:] == ["评分", "商品"], str(BAD_CUSTOMER_COLUMNS[-3:]))
-    check("不含单独的商家 SKU 列",
-          not any("seller" in c.lower() for c in BAD_CUSTOMER_COLUMNS))
+    check("跟④一样带「SKU ID」+「商家 SKU」两列（紧挨着）",
+          BAD_CUSTOMER_COLUMNS[1:3] == ["SKU ID", "商家 SKU"],
+          str(BAD_CUSTOMER_COLUMNS[:4]))
+    check("前 N 列就是客户表本身（列定义只加不改）",
+          BAD_CUSTOMER_COLUMNS[:-2] == list(tc.CUSTOMER_COLUMNS),
+          str(BAD_CUSTOMER_COLUMNS[:4]))
 
     print("8) ⑥ 单独跑：读已有评分表（⑤ 不重跑）")
 
@@ -194,6 +199,11 @@ def main() -> int:
 
         _apply_rating_filter = PipelineThread._apply_rating_filter
         _load_rating_bad = PipelineThread._load_rating_bad
+        # SKU 兜底这两条路（两张表）在 ⑥ 主循环里也会被调到
+        _load_sku_map = PipelineThread._load_sku_map
+        _sku_map_from_rows = PipelineThread._sku_map_from_rows
+        _sku_col_of = staticmethod(PipelineThread._sku_col_of)
+        _sku_pair = PipelineThread._sku_pair
 
         def __init__(self, opts: dict) -> None:
             self.opts = opts
@@ -202,6 +212,7 @@ def main() -> int:
             self.rating_progress = Sink()
             self.rating_ready = Sink()
             self._sku_map_cache: dict = {}
+            self._seller_sku_cache: dict = {}
             self._rating_header: list = []
             self._rating_cols: dict = {"score": "", "buyer": "", "product": ""}
             self._rating_bad: list = []
@@ -281,7 +292,8 @@ def main() -> int:
             return {"code": 0, "data": {"main_order": [
                 {"main_order_id": ids[0],
                  "buyer_info_module": {"buyer_nickname": "buyer_" + ids[0][-4:]},
-                 "sku_module": [{"sku_id": "1732172945808462636"}]}]}}
+                 "sku_module": [{"sku_id": "1732172945808462636",
+                                 "seller_sku_name": "X004RIMEUV"}]}]}}
 
     class Runner2(Runner):
         """⑥ 主循环的桩：把会碰浏览器/网络的几处换掉。"""
@@ -297,6 +309,7 @@ def main() -> int:
             self.bad_progress = Sink()
             self._cust_cache = {}
             self._sku_map_cache = {"x": "y"}     # 非空 → 不去读订单文件
+            self._seller_sku_cache = {"x": "y"}  # 同上（两张兜底表都得置上）
             self.asked: list[str] = []
 
         def _ensure_order_page(self, browser) -> None:
@@ -327,6 +340,61 @@ def main() -> int:
     check("商品跟着带进表（product_id 兜底）",
           [r[list(hdr_c).index("商品")] for r in rows_c]
           == ["1732172928080450348", "1732172928080450348"], str(rows_c))
+    # ★ 商家 SKU 也在差评表里：差评是哪个 SKU 吃的，一眼能看出来 ★
+    check("★ 商家 SKU 跟着带进表（响应里的 seller_sku_name）",
+          [r[list(hdr_c).index("商家 SKU")] for r in rows_c]
+          == ["X004RIMEUV", "X004RIMEUV"], str(rows_c))
+    check("SKU ID 那一列不受影响",
+          [r[list(hdr_c).index("SKU ID")] for r in rows_c]
+          == ["1732172945808462636", "1732172945808462636"], str(rows_c))
+
+    print("10b) ⑥ 单独跑：自己按订单表补**两张**兜底表")
+    # 这次响应里没有 seller_sku_name → 商家 SKU 只能来自订单表兜底
+    class Client3:
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def fetch(self, ids, chunk_size: int = 1):
+            self.asked.extend(list(ids))
+            return {"code": 0, "data": {"main_order": [
+                {"main_order_id": ids[0],
+                 "buyer_info_module": {"buyer_nickname": "b"},
+                 "sku_module": [{"sku_id": "1732172945808462636"}]}]}}
+
+    order_rows = [
+        {"Order ID": "577589364214960772", "SKU ID": "1732172945808462636",
+         "Seller SKU": "X004RIMEUV"},
+        {"Order ID": "577586254751765136", "SKU ID": "1732302878131589932",
+         "Seller SKU": "WT-1"},
+    ]
+    r4 = Runner2({"bad_out": str(TMP / "客户差评3.xlsx")})
+    r4._sku_map_cache = {}          # 模拟「④ 没跑过」
+    r4._seller_sku_cache = {}
+    r4._rating_header = list(REAL_HEADER)
+    r4._rating_cols = {"score": "rating", "buyer": "",
+                       "product": "product_id", "order": "order_id"}
+    got_d = r4._fetch_bad_customers(browser=None, client_obj=Client3(),
+                                    bad_rows=bad_rows_real, origins=None,
+                                    order_rows=order_rows)
+    check("两张兜底表都从订单表建起来了",
+          bool(r4._sku_map_cache) and bool(r4._seller_sku_cache),
+          f"{r4._sku_map_cache} / {r4._seller_sku_cache}")
+    check("日志里两张表各报一行",
+          any("SKU ID 兜底表已就绪" in m for m in r4.log.msgs)
+          and any("商家 SKU 兜底表已就绪" in m for m in r4.log.msgs),
+          str([m for m in r4.log.msgs if "兜底表" in m]))
+    hdr_d, rows_d = te.parse_rating(got_d["out"])
+    check("★ 商家 SKU 落的是订单表里的那一列（响应没有时）",
+          [r[list(hdr_d).index("商家 SKU")] for r in rows_d]
+          == ["X004RIMEUV", "WT-1"],
+          str([r[list(hdr_d).index("商家 SKU")] for r in rows_d]))
+    # 这次 Client3 的响应里**有 sku_id、没有 seller_sku_name** → 正好证明两列
+    # 是**各自**择源的：SKU ID 用响应（第 2 单的订单表值 1732302878131589932 被忽略），
+    # 商家 SKU 用订单表兜底。任何一列取错源都会在这里露出来。
+    check("★ 同一行两列各自择源：SKU ID 用响应 / 商家 SKU 用订单表",
+          [r[list(hdr_d).index("SKU ID")] for r in rows_d]
+          == ["1732172945808462636", "1732172945808462636"],
+          str([r[list(hdr_d).index("SKU ID")] for r in rows_d]))
 
     print("11) ⑥ 没有订单号列、也没有昵称列 → 明确跳过不硬跑")
     r3 = Runner2({"bad_out": str(TMP / "客户差评2.xlsx")})

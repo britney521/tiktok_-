@@ -86,10 +86,14 @@ LIST_AID = "6556"       # order/list 用这个（list.py 抓到的后台真实�
 
 # 客户信息导出的列（顺序即写表顺序）
 # 「SKU ID」= 商品 SKU 的平台 ID（``sku_module[].sku_id``）。
-# 主源是接口响应本身；订单表那条路只是兜底（见 ``read_sku_map``）。
+# 「商家 SKU」= 商家自己填的 Seller SKU（``sku_module[].seller_sku_name``，
+#   如 ``X004RIMEUV`` / ``WT-1``）—— 和「SKU ID」是同一件商品 SKU 的两个 ID，
+#   所以紧挨着放，正好对齐订单表里那两列（``SKU ID`` / ``Seller SKU`` 也相邻）。
+# 两者的主源都是接口响应本身；订单表那条路只是兜底（见 ``read_sku_map``）。
 CUSTOMER_COLUMNS: list[str] = [
     "Order ID",
     "SKU ID",
+    "商家 SKU",
     "Buyer Nickname",
     "Recipient",
     "First Name",
@@ -145,8 +149,15 @@ TransportFn = Callable[[str, dict | None, dict | None], dict[str, Any]]
 # 兜底来源：订单表里「商品 SKU 的平台 ID」可能的列名（随后台语言/版本变），
 # 按优先级取第一个命中的。注意**不是**「Seller SKU」（那是商家自定义编码）。
 SKU_SOURCE_COLUMNS: tuple[str, ...] = ("SKU ID", "商品 SKU", "商品SKU", "Sku ID")
+# 兜底来源：订单表里「商家自定义 SKU」可能的列名。真机 63 列导出里叫 ``Seller SKU``。
+# ★ 别把「商品 SKU」放进来 ★ —— 它是上面那组（平台 ID）的中文别名，两边共用一个
+# 别名会让「同一个订单取到哪一种」变成看列顺序的运气。
+SELLER_SKU_SOURCE_COLUMNS: tuple[str, ...] = (
+    "Seller SKU", "SellerSKU", "商家 SKU", "商家SKU", "自定义 SKU")
 # 接口响应里 sku 节点的字段名：只要**平台 SKU ID**
 SKU_ID_KEYS: tuple[str, ...] = ("sku_id", "skuid", "id")
+# 接口响应里 sku 节点的字段名：只要**商家自定义 SKU**
+SELLER_SKU_KEYS: tuple[str, ...] = ("seller_sku_name", "seller_sku", "sellerSkuName")
 # 一个订单多个 SKU 时的分隔符
 SKU_JOIN = " | "
 
@@ -604,14 +615,11 @@ def _addr_items(shipping_address: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def _sku_ids_from_order(main_order: dict[str, Any]) -> str:
-    """从 order/get 的响应里取**商品 SKU 的平台 ID**（``sku_module[].sku_id``）。
+def _sku_items(main_order: dict[str, Any]) -> list[dict[str, Any]]:
+    """把订单响应里的 sku 节点统一成一个 dict 列表（两种情况都吃）。
 
-    这是客户表「SKU ID」列的**主源**：请求本身就是按 Order ID 打的，响应里带着
-    这一单的 sku 列表，不用再回订单表关联。
-
-    注意不要拿 ``seller_sku_name`` 顶上：那是商家自己填的编码，和平台 SKU ID
-    是两回事。取不到就返回空串（由订单表兜底），不猜。
+    真机上见过两种形状：``sku_module``（list）和 ``sku_list``（可能是 dict 包一层）。
+    取不到就返回空列表，由调用方决定要不要退回订单表，**不猜**。
     """
     node = main_order.get("sku_module")
     if node is None:
@@ -619,17 +627,44 @@ def _sku_ids_from_order(main_order: dict[str, Any]) -> str:
     if isinstance(node, dict):
         node = node.get("sku_list") or node.get("skus") or [node]
     if not isinstance(node, list):
-        return ""
+        return []
+    return [item for item in node if isinstance(item, dict)]
+
+
+def _pick_sku_field(items: list[dict[str, Any]],
+                    keys: Sequence[str]) -> str:
+    """从 sku 节点列表里按 ``keys`` 优先级各取一个值，合并去重成一格。"""
     found: list[str] = []
-    for item in node:
-        if not isinstance(item, dict):
-            continue
-        for key in SKU_ID_KEYS:
+    for item in items:
+        for key in keys:
             val = item.get(key)
             if val:
                 found.append(str(val))
                 break
     return join_skus(found)
+
+
+def _sku_ids_from_order(main_order: dict[str, Any]) -> str:
+    """从 order/get 的响应里取**商品 SKU 的平台 ID**（``sku_module[].sku_id``）。
+
+    这是客户表「SKU ID」列的**主源**：请求本身就是按 Order ID 打的，响应里带着
+    这一单的 sku 列表，不用再回订单表关联。
+
+    注意不要拿 ``seller_sku_name`` 顶上：那是商家自己填的编码，和平台 SKU ID
+    是两回事（要它的是「商家 SKU」那一列，见 ``_seller_skus_from_order``）。
+    取不到就返回空串（由订单表兜底），不猜。
+    """
+    return _pick_sku_field(_sku_items(main_order), SKU_ID_KEYS)
+
+
+def _seller_skus_from_order(main_order: dict[str, Any]) -> str:
+    """从 order/get 的响应里取**商家自定义 SKU**（``sku_module[].seller_sku_name``）。
+
+    真机样本（``_sample_list.json``）：同一个 sku 节点里
+    ``sku_id='1729919044091812338'``、``seller_sku_name='DW2*1'`` —— 后者就是商家
+    自己填的编码，客户表「商家 SKU」列要的是它。取不到返回空串，由订单表兜底。
+    """
+    return _pick_sku_field(_sku_items(main_order), SELLER_SKU_KEYS)
 
 
 def join_skus(values: Sequence[Any], sep: str = SKU_JOIN) -> str:
@@ -642,11 +677,13 @@ def join_skus(values: Sequence[Any], sep: str = SKU_JOIN) -> str:
     return sep.join(out)
 
 
-def parse_customer(main_order: dict[str, Any], sku_ids: str = "") -> dict[str, str]:
+def parse_customer(main_order: dict[str, Any], sku_ids: str = "",
+                   seller_skus: str = "") -> dict[str, str]:
     """从单条 main_order 里抽出客户信息，缺失字段填空串。
 
     :param sku_ids: 兜底用的 SKU ID（由订单表按 Order ID 关联而来），
         只在响应里没有 sku 节点时顶上
+    :param seller_skus: 兜底用的**商家 SKU**（同样来自订单表），同上
     """
     bim = main_order.get("buyer_info_module") or {}
     addr = bim.get("shipping_address") or {}
@@ -660,6 +697,7 @@ def parse_customer(main_order: dict[str, Any], sku_ids: str = "") -> dict[str, s
     return {
         "Order ID": str(main_order.get("main_order_id") or ""),
         "SKU ID": _sku_ids_from_order(main_order) or sku_ids,
+        "商家 SKU": _seller_skus_from_order(main_order) or seller_skus,
         "Buyer Nickname": str(bim.get("buyer_nickname") or ""),
         "Recipient": items.get("name", ""),
         "First Name": items.get("first_name", ""),
@@ -679,14 +717,17 @@ def parse_customer(main_order: dict[str, Any], sku_ids: str = "") -> dict[str, s
     }
 
 
-def blank_customer(order_id: str, status: str, sku_ids: str = "") -> dict[str, str]:
+def blank_customer(order_id: str, status: str, sku_ids: str = "",
+                   seller_skus: str = "") -> dict[str, str]:
     """请求失败时的占位行，保证输出行数与原表一致。
 
-    接口没回来的那些行，SKU ID 由订单表按 Order ID 补上（便于拿它回订单表核对）。
+    接口没回来的那些行，SKU ID 与商家 SKU 由订单表按 Order ID 补上（便于拿它们
+    回订单表核对）。
     """
     row = {col: "" for col in CUSTOMER_COLUMNS}
     row["Order ID"] = str(order_id)
     row["SKU ID"] = sku_ids
+    row["商家 SKU"] = seller_skus
     row["Fetch Status"] = status
     return row
 

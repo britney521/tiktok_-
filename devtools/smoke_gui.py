@@ -64,6 +64,9 @@ API_SKUS = {oid: f"1732505384{i:04d}" for i, oid in enumerate(ORDER_IDS)}
 ORDER_SKUS = {oid: f"SKU-{oid[-4:]}" for oid in ORDER_IDS}
 # 订单表里另一个同形状的列：商家自定义编码 —— 千万别拿它当 SKU ID
 ORDER_SELLER_SKUS = {oid: f"SELLER-{oid[-4:]}" for oid in ORDER_IDS}
+# 接口响应里的 sku_module[].seller_sku_name（客户表「商家 SKU」的**主源**）
+# 同样刻意和订单表那列取不同的值：两列都得能看出自己走的是哪条路
+API_SELLER_SKUS = {oid: f"API-SELLER-{oid[-4:]}" for oid in ORDER_IDS}
 
 # 导出文件的表头（真实导出是 63 列，这里取带客户字段的一小撮）
 EXPORT_COLUMNS = [
@@ -158,11 +161,11 @@ def _order_get_payload(oid: str) -> dict:
         "message": "success",
         "data": {"main_order": [{
             "main_order_id": oid,
-            # 客户表「SKU ID」的主源：sku_module 里的 sku_id（平台 ID，
-            # 不是商家自定义编码 seller_sku_name）
+            # 客户表「SKU ID」的主源：sku_module 里的 sku_id（平台 ID）；
+            # 「商家 SKU」的主源：同一个节点里的 seller_sku_name（商家自定义编码）
             "sku_module": [{
                 "sku_id": API_SKUS[oid],
-                "seller_sku_name": ORDER_SELLER_SKUS[oid],
+                "seller_sku_name": API_SELLER_SKUS[oid],
             }],
             "buyer_info_module": {
                 "buyer_nickname": f"buyer_{oid[-4:]}",
@@ -818,6 +821,12 @@ def main() -> int:
         for r, oid in enumerate(ORDER_IDS, start=1):
             got_sku = crows[r][cmap["SKU ID"]]
             assert got_sku == API_SKUS[oid], f"{oid} 的 SKU ID：{got_sku!r}"
+            # 商家 SKU 取的是**同一个节点里的 seller_sku_name**，
+            # 不是订单表那列（ORDER_SELLER_SKUS）—— 两列各有各的源，不能串
+            got_seller = crows[r][cmap["商家 SKU"]]
+            assert got_seller == API_SELLER_SKUS[oid], \
+                f"{oid} 的商家 SKU：{got_seller!r}（订单表那列是 " \
+                f"{ORDER_SELLER_SKUS[oid]!r}，取错源了）"
         assert FAKE.opened and FAKE.closed, "店铺未正确开关"
 
         # ★ 抓客户前必须把页面停到**订单页**（2026-10-14 用户真机定案的
@@ -909,13 +918,19 @@ def main() -> int:
         statuses = {win.tbl_customers.item(r, _st_col).text()
                     for r in range(win.tbl_customers.rowCount())}
         assert statuses == {"SKIPPED"}, statuses
-        # 一条响应都没拿到 → SKU ID 只能由订单表补，且必须是 SKU ID 列（不是 Seller SKU）
+        # 一条响应都没拿到 → 两列都只能由订单表补：
+        # SKU ID 认「SKU ID」列，商家 SKU 认「Seller SKU」列，各认各的
         _sku_col = tc.CUSTOMER_COLUMNS.index("SKU ID")
         skus = {win.tbl_customers.item(r, _sku_col).text()
                 for r in range(win.tbl_customers.rowCount())}
         assert skus == set(ORDER_SKUS.values()), f"占位行的 SKU ID 没补上：{skus}"
+        _seller_col = tc.CUSTOMER_COLUMNS.index("商家 SKU")
+        sellers = {win.tbl_customers.item(r, _seller_col).text()
+                   for r in range(win.tbl_customers.rowCount())}
+        assert sellers == set(ORDER_SELLER_SKUS.values()), \
+            f"占位行的商家 SKU 没补上（或补成了 SKU ID 那列）：{sellers}"
         print(f"    只发 {page.get_calls} 次请求即中止；客户表状态={statuses}"
-              f"（占位行 SKU ID 已由订单表补齐）")
+              f"（占位行 SKU ID / 商家 SKU 已分别由订单表两列补齐）")
         assert win.lbl_selected.text(), "选中店铺标签丢了"
 
         print("[7] 真机场景：通用站 98001008 / eu 无路由 / us 同源通 → 锁定 us 站")
@@ -1199,10 +1214,16 @@ def main() -> int:
             assert not warns, f"有评分表（自带订单号）却被拦下来：{warns}"
             assert win.tbl_bad.rowCount() == 2, win.tbl_bad.rowCount()
             assert page.get_calls == 2, f"⑥ 请求次数不对：{page.get_calls}"
-            # 连 SKU ID 兜底列也不该依赖订单表（它来自接口响应的 sku_module）
+            # 连 SKU 兜底列也不该依赖订单表（它来自接口响应的 sku_module）
             skus13 = [win.tbl_bad.item(r, cg.BAD_CUSTOMER_COLUMNS.index("SKU ID")).text()
                       for r in range(win.tbl_bad.rowCount())]
             assert skus13 == [API_SKUS[ORDER_IDS[1]], API_SKUS[ORDER_IDS[2]]], skus13
+            # 差评表也带「商家 SKU」——差评是哪个 SKU 吃的，一眼能看出来
+            sellers13 = [win.tbl_bad.item(
+                r, cg.BAD_CUSTOMER_COLUMNS.index("商家 SKU")).text()
+                for r in range(win.tbl_bad.rowCount())]
+            assert sellers13 == [API_SELLER_SKUS[ORDER_IDS[1]],
+                                 API_SELLER_SKUS[ORDER_IDS[2]]], sellers13
             assert "自带订单号列" in win.log_box.toPlainText(), \
                 "没说明⑥走的是文件自带的订单号"
 
