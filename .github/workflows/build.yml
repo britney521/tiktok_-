@@ -87,6 +87,13 @@ jobs:
         working-directory: ${{ steps.proj.outputs.dir }}
         run: python devtools/test_transport.py
 
+      # 「强制关掉已开启的紫鸟」的回归：把真正发 taskkill/tasklist/pgrep 的函数
+      # 换成假的，断言 Windows 分支的命令行内容与顺序。不碰 runner 上的进程。
+      - name: 强制重启客户端测试
+        shell: bash
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: python devtools/test_client_kill.py
+
       # 源码态先自检一次：逻辑问题在这里就暴露，比打包后再查快得多
       - name: 源码自检
         shell: bash

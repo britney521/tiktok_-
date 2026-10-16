@@ -47,7 +47,9 @@ TikTok 商家后台的订单/客户接口都必须带**店铺自己的登录态*
 from __future__ import annotations
 
 import json
+import platform
 import shutil
+import subprocess
 import sys
 import time
 import types
@@ -56,6 +58,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# 当前平台（模块级常量，便于离线回归里替换成 Windows 分支去断言命令行）
+_IS_WINDOWS = platform.system() == "Windows"
 
 # 开发态默认位置：<工作区>/紫鸟浏览器/ziniao_webdriver_demo
 # （这份是带 config.yaml 的「真身」，所以优先级要排在仓库内 vendor 之前）
@@ -441,6 +446,131 @@ def client_hint(cfg: Any, root: str | Path | None = None) -> str:
             return f"生成客户端诊断信息失败：{exc}"
     return ("没找到紫鸟客户端程序。「客户端路径」留空即可自动查找，"
             r"Windows 也可直接填 exe 全路径（如 D:\紫鸟\ziniao\ziniao.exe）。")
+
+
+# ----------------------------------------------------------------------------
+# 1b. 强制关掉已开启的紫鸟客户端
+# ----------------------------------------------------------------------------
+# ★ 为什么要「先关掉再启动」（2026-10-16 用户定案）★
+# 紫鸟客户端是**进程唯一**的。用户手动开着紫鸟、或上一轮流程留下的实例还在时，
+# 再拉起一个 `--run_type=web_driver` 的实例，**新进程会被旧实例接管或直接退出**
+# （Windows 单实例锁），`--run_type=web_driver` / `--port=` 根本没生效 —— 于是
+# startBrowser 拿回来的 `debuggingPort` 是旧实例（甚至另一个浏览器窗口）的，
+# CDP 连上去就会出各种「说不清哪儿不对」的问题：连到别的 target、页面操作不
+# 生效、过一会儿掉线。所以「启动环境」一律先清干净，再起一个干净实例。
+#
+# ★ 为什么不能只靠 vendor 的 kill_process() ★
+# 它按配置里的 `version` 挑**一个**进程名（v5→SuperBrowser.exe，其它→ziniao.exe）
+# 去 taskkill。可紫鸟的进程名随安装包而变，真机上见过 ziniao.exe /
+# ZiniaoBrowser.exe / SuperBrowser.exe 三种；配置写 v6 而实际进程叫
+# ZiniaoBrowser.exe 时就漏杀，而漏一个等于没杀。这里按名字**全杀一遍**，
+# 再让 kill_process() 兜底 + 等 IPC 端口真正释放。
+_WIN_CLIENT_EXE_NAMES = ("ziniao.exe", "ZiniaoBrowser.exe", "SuperBrowser.exe")
+# 非 Windows 要杀的名字：Electron 主进程 + 店铺浏览器进程
+_POSIX_CLIENT_NAMES = ("ziniaobrowser", "ziniao")
+
+
+def _run_quiet(cmd: list[str], timeout: float = 20.0):
+    """跑一条「只关心成没成」的外部命令；异常 / 超时返回 None。
+
+    单独抽出来是为了**可测**：离线回归里把它换掉，就能断言到底发了哪些命令，
+    而不会真去动本机的进程。Windows 上加 ``CREATE_NO_WINDOW``，免得打包成 exe
+    后每次清进程都在用户脸上闪一个黑框。
+    """
+    kw: dict[str, Any] = {}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,  # noqa: S603
+                              timeout=timeout, **kw)
+    except Exception:
+        return None
+
+
+def running_clients() -> list[int]:
+    """列出当前在跑的紫鸟客户端进程 PID；数不出来就返回空列表。
+
+    只用来「写进日志让用户看得见」和「杀完还有残留要报出来」，
+    **绝不当判断依据** —— 数不到不代表没有进程。
+    """
+    pids: list[int] = []
+    try:
+        if _IS_WINDOWS:
+            for name in _WIN_CLIENT_EXE_NAMES:
+                r = _run_quiet(["tasklist", "/fi", f"imagename eq {name}",
+                                "/fo", "csv", "/nh"], timeout=15)
+                for line in (getattr(r, "stdout", "") or "").splitlines():
+                    # "ziniao.exe","1234","Console","1","132,608 K"
+                    # 内存列自带逗号，但前两列够用了（进程名不可能含逗号）
+                    parts = [c.strip().strip('"') for c in line.split(",")]
+                    if len(parts) >= 2 and parts[0].lower() == name.lower():
+                        try:
+                            pids.append(int(parts[1]))
+                        except ValueError:
+                            continue
+        else:
+            for name in _POSIX_CLIENT_NAMES:
+                r = _run_quiet(["pgrep", "-x", name], timeout=10)
+                for line in (getattr(r, "stdout", "") or "").splitlines():
+                    try:
+                        pids.append(int(line.strip()))
+                    except ValueError:
+                        continue
+    except Exception:
+        return []
+    return sorted(set(pids))
+
+
+def kill_all_clients(client: Any, log: LogFn | None = None) -> int:
+    """强制关掉**所有**已开启的紫鸟客户端，返回「动手前数到几个」。
+
+    含用户自己手动开着的那一个 —— 这正是要的：「本来开着紫鸟，再启动一个会串到
+    旧进程上，CDP 就出问题」。多花十几秒，换掉一整类难排查的问题。
+
+    顺序：
+      1. 数一下有几个（写日志；调用方也能拿它判断这次是不是真有关掉东西）；
+      2. Windows：把所有可能的进程名 ``taskkill /f /t`` 一遍（``/t`` 连子进程一起，
+         店铺浏览器就是它的子进程）；其它平台交给 vendor 的 pkill 三连；
+      3. ``client.kill_process()`` 兜底，并**等 IPC 端口真正释放**（不等就启，
+         新实例可能撞端口）；
+      4. 复查：还有残留就再来一轮（最多两轮，不做死循环）。
+
+    全程不抛异常：杀不干净也得让「启动环境」继续往下走，由后面 ``start_browser``
+    的端口等待去报错 —— 别把真正的启动错误吞在杀进程这一步。
+    """
+    emit = log or (lambda _m: None)
+
+    def say(msg: str) -> None:
+        try:
+            emit(msg)
+        except Exception:
+            pass
+
+    before = running_clients()
+    say(f"强制关闭已开启的紫鸟客户端…（检测到 {len(before)} 个紫鸟进程）"
+        if before else
+        "强制关闭已开启的紫鸟客户端…（没检测到运行中的进程，仍清一次残留）")
+
+    left: list[int] = []
+    for _round in range(2):
+        if _IS_WINDOWS:
+            for name in _WIN_CLIENT_EXE_NAMES:
+                _run_quiet(["taskkill", "/f", "/t", "/im", name], timeout=20)
+        try:
+            client.kill_process()
+        except Exception as exc:                       # noqa: BLE001
+            say(f"终止客户端进程异常（忽略）：{type(exc).__name__}: {exc}")
+        left = running_clients()
+        if not left:
+            break
+        say(f"还有 {len(left)} 个紫鸟进程没退（{left}），再清一轮…")
+    else:
+        # for 正常走完 = 两轮之后仍有残留
+        say(f"⚠ 仍检测到紫鸟进程 {left} —— 若接下来启动环境失败，请手动在任务管理器里"
+            "结束它们（或重启电脑）后再试。")
+
+    say(f"已关闭紫鸟客户端（这之前有 {len(before)} 个在跑）")
+    return len(before)
 
 
 # ----------------------------------------------------------------------------

@@ -145,6 +145,22 @@ check("首行首列正确", rows and str(rows[0][0]) == "1729", str(rows[:1]))
 out = te.write_rows(header, rows, TMP / "rating_out.xlsx", sheet="商品评分")
 check("写出的文件可读", te.parse_rating(out)[1] == rows)
 
+# ★ 输出框允许用户浏览选中一个 .csv（③订单 / ⑤评分弹的是「浏览选择」框）★
+# 这时必须**真写 CSV**，不能把 xlsx 内容塞进 .csv 文件名里骗人。
+csv_out = te.write_rows(header, rows, TMP / "rating_out.csv", sheet="商品评分")
+check("改成 .csv 后缀 → 写出来的不是 xlsx 字节（没有 PK 头）",
+      csv_out.read_bytes()[:2] != b"PK", repr(csv_out.read_bytes()[:2]))
+check("CSV 带 BOM（Excel 双击打开中文不乱码）",
+      csv_out.read_bytes()[:3] == b"\xef\xbb\xbf", repr(csv_out.read_bytes()[:3]))
+csv_header, csv_rows = te.parse_rating(csv_out)
+check("CSV 表头原样", csv_header == header, str(csv_header))
+check("CSV 数据原样（按字符串比，避免数值/文本类型差异）",
+      [[str(c) for c in r] for r in csv_rows]
+      == [[str(c) for c in r] for r in rows], str(csv_rows))
+# 没后缀 / 大写后缀都得走 xlsx 那条路
+check(".XLSX 大写后缀也写 xlsx",
+      te.write_rows(header, rows, TMP / "up.XLSX").read_bytes()[:2] == b"PK")
+
 print("\n== 4) 路径 A：点「导出」时直接拦到下载请求 ==")
 te.PAGE_SETTLE = 0
 te.PANEL_SETTLE = 0

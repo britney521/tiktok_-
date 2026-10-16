@@ -246,7 +246,7 @@ class LogBus(QObject):
 # 后台线程
 # ----------------------------------------------------------------------------
 class EnvThread(QThread):
-    """启动环境：终止旧进程 → 启动客户端 → 更新内核。"""
+    """启动环境：强制关掉已开启的客户端 → 启动一个新的 web_driver 实例 → 更新内核。"""
 
     log = pyqtSignal(str)
     done = pyqtSignal(bool, str)
@@ -265,23 +265,28 @@ class EnvThread(QThread):
             self.done.emit(False, f"加载紫鸟项目失败：{exc}")
             return
         try:
-            # ★ 客户端已经在跑就直接复用，别再 kill 一遍 ★
-            # 紫鸟**进程唯一**：GUI 实例占着位置时自动化实例起不来，所以只有端口
-            # 被占死时才需要真的 kill。复用能少一次无谓的重启（也不打断已有会话）。
+            # ★ 先定「要不要重新拉起一个客户端」★
             reused = False
-            try:
-                reused = bool(client.port_open())
-            except Exception:
-                reused = False
-            if reused:
-                self.log.emit(
-                    f"检测到紫鸟客户端已在运行（IPC 端口 "
-                    f"{getattr(client, 'socket_port', '') or '(未知)'} 已就绪），"
-                    "直接复用，不再重启。")
+            if self.kill_first:
+                # 强制重启（默认）：**不管现在有没有在跑，一律先关干净**。
+                # 紫鸟客户端进程唯一 —— 用户手动开的那个实例还在时，新起的
+                # web_driver 实例会被它接管/直接退出，`--run_type` / `--port`
+                # 没生效，startBrowser 返回的 debuggingPort 是旧实例的，
+                # CDP 连上去就会连错目标。所以先把所有紫鸟进程清掉再启。
+                zb.kill_all_clients(client, log=self.log.emit)
             else:
-                if self.kill_first:
-                    self.log.emit("终止旧的紫鸟客户端进程…")
-                    client.kill_process()
+                # 没勾：能复用就复用（少一次无谓重启），只有端口没开才启新实例。
+                try:
+                    reused = bool(client.port_open())
+                except Exception:
+                    reused = False
+                if reused:
+                    self.log.emit(
+                        f"检测到紫鸟客户端已在运行（IPC 端口 "
+                        f"{getattr(client, 'socket_port', '') or '(未知)'} 已就绪），"
+                        "直接复用，不再重启。")
+
+            if not reused:
                 self.log.emit("启动客户端（web_driver + http IPC）…")
                 if not client.start_browser():
                     if not client.config.client_executable():
@@ -1660,13 +1665,19 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         grid.addLayout(bar, 4, 0, 1, 4)
 
-        # 默认**不**勾选：客户端已在运行就直接复用，不再把它关掉重启。
-        self.chk_kill = QCheckBox("强制重启客户端（会关掉已有的紫鸟实例）")
-        self.chk_kill.setChecked(False)
+        # ★ 默认**勾选**（2026-10-16 用户定案）★
+        # 已经开着紫鸟、再让程序启动一个，两个实例会串到同一个进程上：新实例的
+        # `--run_type=web_driver` / `--port` 不生效（Windows 单实例锁），startBrowser
+        # 返回的 debuggingPort 是旧实例的 → CDP 连错目标、页面操作失灵。所以默认
+        # 「启动环境」先把已开启的紫鸟全部关掉，再起一个干净的实例。
+        self.chk_kill = QCheckBox("强制重启客户端（先关掉已开启的紫鸟，再起新的）")
+        self.chk_kill.setChecked(True)
         self.chk_kill.setToolTip(
-            "默认不勾选：检测到客户端已在运行就直接复用。\n"
-            "勾选后：先杀掉所有紫鸟进程、再重新拉起一个 web_driver 实例。\n"
-            "只有「端口被占死 / 复用后店铺打不开」时才需要勾。")
+            "默认勾选：启动环境前先杀掉**所有**紫鸟进程（含你自己手动打开的那个），\n"
+            "再拉起一个干净的 web_driver 实例。\n"
+            "为什么需要：紫鸟客户端进程唯一，旧实例还在时新实例起不来 / 启动参数被吞，\n"
+            "startBrowser 返回的调试端口可能是旧实例的 → CDP 连错进程。\n"
+            "取消勾选：检测到客户端已在运行（IPC 端口已就绪）就直接复用，不重启。")
         grid.addWidget(self.chk_kill, 5, 0, 1, 4)
 
         grid.setColumnStretch(1, 1)
@@ -1742,13 +1753,13 @@ class MainWindow(QMainWindow):
         self.ed_order_out.setMinimumWidth(120)
         self.ed_order_out.setToolTip(
             "文件名默认按店铺命名（选中店铺后自动填入）。\n"
-            "点「浏览…」只换**存放目录**，文件名不变；\n"
-            "想连文件名一起改，直接在这个框里敲完整路径。")
+            "点「浏览…」在目录里**选中**一个 xlsx / csv 文件（导出就写它，已存在则覆盖）；\n"
+            "想指定一个还不存在的路径，直接在这个框里敲完整路径。")
         grid.addWidget(self.ed_order_out, 0, 1, 1, 3)
         btn_out = QPushButton("浏览…")
-        btn_out.setToolTip("选择订单文件的存放目录（文件名保持 <店铺名>_订单.xlsx）")
+        btn_out.setToolTip("浏览选择订单要写进的 xlsx / csv 文件（已存在则覆盖）")
         btn_out.clicked.connect(
-            lambda: self._pick_output_dir(self.ed_order_out, DEFAULT_ORDER_OUT))
+            lambda: self._pick_output_file(self.ed_order_out, DEFAULT_ORDER_OUT))
         grid.addWidget(btn_out, 0, 4)
 
         bar = QHBoxLayout()
@@ -1799,10 +1810,11 @@ class MainWindow(QMainWindow):
         self.ed_cust_out.setMinimumWidth(120)
         self.ed_cust_out.setToolTip(
             "文件名默认按店铺命名（选中店铺后自动填入）。\n"
-            "点「浏览…」只换存放目录，文件名不变；想连文件名一起改就直接敲完整路径。")
+            "点「浏览…」选择**文件夹**，文件就存进这个文件夹（文件名不变）；\n"
+            "想连文件名一起改，就直接敲完整路径。")
         grid.addWidget(self.ed_cust_out, 2, 1, 1, 3)
         btn_out = QPushButton("浏览…")
-        btn_out.setToolTip("选择客户文件的存放目录（文件名保持 <店铺名>_客户.xlsx）")
+        btn_out.setToolTip("选择存放的文件夹（文件名保持 <店铺名>_客户.xlsx）")
         btn_out.clicked.connect(
             lambda: self._pick_output_dir(self.ed_cust_out, DEFAULT_CUSTOMER_OUT))
         grid.addWidget(btn_out, 2, 4)
@@ -1853,12 +1865,13 @@ class MainWindow(QMainWindow):
         self.ed_rating_out.setMinimumWidth(120)
         self.ed_rating_out.setToolTip(
             "文件名默认按店铺命名（选中店铺后自动填入）。\n"
-            "点「浏览…」只换存放目录，文件名不变；想连文件名一起改就直接敲完整路径。")
+            "点「浏览…」在目录里**选中**一个 xlsx / csv 文件（导出就写它，已存在则覆盖）；\n"
+            "想指定一个还不存在的路径，直接在这个框里敲完整路径。")
         grid.addWidget(self.ed_rating_out, 0, 1, 1, 3)
         btn_out = QPushButton("浏览…")
-        btn_out.setToolTip("选择评分文件的存放目录（文件名保持 <店铺名>_商品评分.xlsx）")
+        btn_out.setToolTip("浏览选择评分要写进的 xlsx / csv 文件（已存在则覆盖）")
         btn_out.clicked.connect(
-            lambda: self._pick_output_dir(self.ed_rating_out, DEFAULT_RATING_OUT))
+            lambda: self._pick_output_file(self.ed_rating_out, DEFAULT_RATING_OUT))
         grid.addWidget(btn_out, 0, 4)
 
         # ⑥ 差评客户：优先用评分文件自带的订单号；没有才靠昵称回订单表
@@ -1867,12 +1880,13 @@ class MainWindow(QMainWindow):
         self.ed_bad_out.setMinimumWidth(120)
         self.ed_bad_out.setToolTip(
             "⑥ 抓取 1~3 星评价对应客户的收货信息，文件名默认按店铺命名。\n"
-            "点「浏览…」只换存放目录，文件名不变；想连文件名一起改就直接敲完整路径。\n"
+            "点「浏览…」选择**文件夹**，文件就存进这个文件夹（文件名不变）；\n"
+            "想连文件名一起改，就直接敲完整路径。\n"
             "评分文件自带订单号列（真机导出的 CSV 就有）时不需要订单表；\n"
             "只有老版「仅昵称」的评分文件才需要③的订单表做关联。")
         grid.addWidget(self.ed_bad_out, 1, 1, 1, 3)
         btn_bad = QPushButton("浏览…")
-        btn_bad.setToolTip("选择差评客户文件的存放目录（文件名保持 <店铺名>_客户差评信息.xlsx）")
+        btn_bad.setToolTip("选择存放的文件夹（文件名保持 <店铺名>_客户差评信息.xlsx）")
         btn_bad.clicked.connect(
             lambda: self._pick_output_dir(self.ed_bad_out, DEFAULT_BAD_CUSTOMER_OUT))
         grid.addWidget(btn_bad, 1, 4)
@@ -2345,13 +2359,46 @@ class MainWindow(QMainWindow):
         StoreJsonDialog(store, self).exec()
 
     # -- ③④⑤⑥ 文件选择 ------------------------------------------------------
-    def _pick_output_dir(self, line: QLineEdit, default: Path) -> None:
-        """「浏览…」：给输出文件挑**存放目录**（文件名保持自动生成的那个）。
+    def _pick_output_file(self, line: QLineEdit, default: Path) -> None:
+        """「浏览…」：**浏览并选中一个文件**（③订单 / ⑤评分用）。
 
-        以前这几颗按钮是「另存为…」，弹保存对话框逼用户起文件名 —— 可名字本来
-        就按店铺名自动填好了，多这一步纯粹碍事；用户真正想改的几乎总是「存到哪个
-        文件夹」。所以改成只选目录：**文件名原样保留**，只换它前面的目录部分。
+        这两个框存的是「导出文件本身」，用户要的是**在目录树里点中那个
+        `.xlsx` / `.csv`** —— 所以弹的是「打开」式的浏览框，选中即填进框；
+        导出时就写这个文件（已存在则覆盖）。
+
+        不是「另存为」对话框：那个要用户现起一个文件名，还得应付覆盖确认。
+
+        起始位置沿用**上次选过的目录**，并尽量把光标落在框里当前那个文件上。
+        想指定一个还不存在的文件（新目录 / 新名字），直接在框里敲完整路径 ——
+        框本来就可编辑。
+        """
+        cur = line.text().strip()
+        start = dir_of(cur or default)
+        if self._last_out_dir and Path(self._last_out_dir).is_dir():
+            start = Path(self._last_out_dir)
+        initial = str(Path(start) / Path(cur).name) if cur else str(start)
+        # 过滤器只放**我们真能写**的两种：`.xls`（老格式）和 `.xlsm`（带宏）都写不了，
+        # 放进来只会让用户选中一个然后拿到个「格式不对」的文件。
+        chosen, _sel = QFileDialog.getOpenFileName(
+            self, "选择文件", initial,
+            "Excel / CSV 文件 (*.xlsx *.csv);;所有文件 (*)")
+        if not chosen:
+            return
+        p = Path(chosen)
+        self._last_out_dir = str(p.parent)
+        line.setText(str(p))
+        self.log_line(f"输出位置：{p}")
+
+    def _pick_output_dir(self, line: QLineEdit, default: Path) -> None:
+        """「浏览…」：给**目录**型输出框挑存放目录（④客户 / ⑥差评用这个）。
+
+        ④⑥ 的文件名一律按店铺名自动生成（`<店铺名>_客户.xlsx` /
+        `<店铺名>_客户差评信息.xlsx`），用户要决定的只是「放进哪个文件夹」——
+        所以只弹目录选择框：**文件名原样保留**，只换它前面的目录部分。
         想连文件名一起改，直接在输入框里敲完整路径即可（框本来就可编辑）。
+
+        ③订单 / ⑤评分不一样：那两个存的是「导出文件本身」，用
+        ``_pick_output_file``（弹保存对话框，能改名、能换 csv）。
 
         起始目录优先用**上次选过的那个**，所以想把几个文件都收进同一个文件夹时，
         第一下选好，后面几个点开就是对的目录，直接确定。

@@ -599,9 +599,66 @@ def main() -> int:
     print(f"    账号: {win.lbl_account.text()}")
     print(f"    ③导出选项: 范围={cg.DEFAULT_EXPORT_SCOPE}｜格式={cg.DEFAULT_EXPORT_FORMAT}"
           "（界面已固定走默认，无对应控件）")
-    # 「强制重启客户端」默认关 —— 客户端已在跑就复用，不关掉用户自己打开的那个
-    assert not win.chk_kill.isChecked(), "「强制重启客户端」必须默认不勾选"
-    print(f"    ①区默认值: 强制重启={win.chk_kill.isChecked()}")
+    # 「强制重启客户端」默认**开** —— 已经开着紫鸟再启动一个会串到旧进程上，
+    # startBrowser 返回的调试端口是旧实例的 → CDP 连错目标。所以默认先清干净。
+    assert win.chk_kill.isChecked(), "「强制重启客户端」必须默认勾选"
+    assert "关掉已开启的紫鸟" in win.chk_kill.text(), win.chk_kill.text()
+    print(f"    ①区默认值: 强制重启={win.chk_kill.isChecked()}｜{win.chk_kill.text()}")
+
+    print("[1b] ①启动环境：勾了「强制重启」→ 先关掉已开启的紫鸟，再起新的")
+
+    class _KillClient:
+        """假客户端：只记调用顺序，顺便谎报「IPC 端口已就绪」。"""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def port_open(self, port=None):        # noqa: ARG002
+            self.calls.append("port_open")
+            return True                        # 故意说「已就绪」，看还会不会去杀
+
+        def kill_process(self, *a, **k):       # noqa: ARG002
+            self.calls.append("kill_process")
+            return True
+
+        def start_browser(self):
+            self.calls.append("start_browser")
+            return True
+
+        def update_core(self, on_progress=None):  # noqa: ARG002
+            self.calls.append("update_core")
+            return True
+
+    real_make, real_kill = zb.make_client, zb.kill_all_clients
+    made: list[_KillClient] = []
+    killed: list[_KillClient] = []
+
+    def _fake_make(cfg, log=None, root=None):  # noqa: ARG001
+        c = _KillClient()
+        made.append(c)
+        return c
+
+    def _fake_kill_all(cli, log=None):         # noqa: ARG001
+        killed.append(cli)
+        (log or (lambda *_a: None))("强制关闭已开启的紫鸟客户端…（冒烟桩）")
+        return 1
+
+    zb.make_client, zb.kill_all_clients = _fake_make, _fake_kill_all
+    try:
+        cg.EnvThread(None, None, True).run()
+        c1 = made[-1]
+        assert killed and killed[-1] is c1, "勾了强制重启却没去关已开启的紫鸟"
+        assert "start_browser" in c1.calls, c1.calls
+        assert "port_open" not in c1.calls, f"勾了就不该再走「复用」判断：{c1.calls}"
+        print("    勾选 → kill_all_clients 之后 start_browser（不看端口是否就绪）")
+
+        cg.EnvThread(None, None, False).run()
+        c2 = made[-1]
+        assert not any(x is c2 for x in killed), "没勾就只走「复用」判断，不杀"
+        assert "port_open" in c2.calls and "start_browser" not in c2.calls, c2.calls
+        print("    未勾选 + 端口就绪 → 直接复用，不重启")
+    finally:
+        zb.make_client, zb.kill_all_clients = real_make, real_kill
 
     print("[2] 布局溢出检查")
     print("    无溢出" if check_layout(win) else "    布局存在问题")
@@ -654,6 +711,48 @@ def main() -> int:
     win._pick_output_dir(win.ed_cust_out, cg.DEFAULT_CUSTOMER_OUT)
     assert win.ed_cust_out.text() == before, win.ed_cust_out.text()
     print("    只换目录 / 空框用默认名 / 记住上次目录 / 取消不改动 → OK")
+    for _n, _v in saved.items():
+        getattr(win, _n).setText(_v)
+
+    print("[2c] ③订单 / ⑤评分的「浏览…」：浏览选中一个 xlsx / csv 文件")
+    tips = {b.toolTip() for b in win.findChildren(QPushButton) if b.text() == "浏览…"}
+    assert any("浏览选择" in t for t in tips), tips        # ③⑤ 弹「打开」式浏览框
+    assert any("存放的文件夹" in t for t in tips), tips    # ④⑥ 只选文件夹
+    print("    ③⑤=浏览选中文件，④⑥=选文件夹 → OK")
+
+    open_calls: list[tuple[str, str]] = []
+    picked_f = {"file": ""}
+
+    def _fake_open_file(parent=None, title="", path="", *a, **k):
+        """桩掉模态浏览框（同上，offscreen 下真弹会永久阻塞）。"""
+        open_calls.append((str(title), str(path)))
+        return picked_f["file"], ""
+
+    cg.QFileDialog.getOpenFileName = staticmethod(_fake_open_file)
+    target = out_dir / "手工选的评分.csv"
+    target.write_text("x")
+    win._last_out_dir = str(out_dir)          # 上一步刚选过这个目录
+    win.ed_order_out.setText(str(src_dir / "某店_订单.xlsx"))
+    picked_f["file"] = str(target)
+    win._pick_output_file(win.ed_order_out, cg.DEFAULT_ORDER_OUT)
+    assert win.ed_order_out.text() == str(target), win.ed_order_out.text()
+    # 弹的是浏览框（不是「另存为」），起始路径 = 上次选过的目录 + 框里当前的文件名
+    assert open_calls[-1][0] == "选择文件", open_calls[-1]
+    assert open_calls[-1][1] == str(out_dir / "某店_订单.xlsx"), open_calls[-1]
+    # 选中 .csv → 真按 csv 写（不是把 xlsx 内容塞进 .csv 里骗人）
+    te.write_rows(["a", "b"], [["1", "2"]], Path(win.ed_order_out.text()))
+    assert Path(win.ed_order_out.text()).read_bytes()[:2] != b"PK"
+    # ⑤ 走的是同一套
+    picked_f["file"] = str(target)
+    win._pick_output_file(win.ed_rating_out, cg.DEFAULT_RATING_OUT)
+    assert win.ed_rating_out.text() == str(target), win.ed_rating_out.text()
+    # 取消（返回空串）→ 一个字都不动
+    picked_f["file"] = ""
+    before_f = win.ed_rating_out.text()
+    win._pick_output_file(win.ed_rating_out, cg.DEFAULT_RATING_OUT)
+    assert win.ed_rating_out.text() == before_f, win.ed_rating_out.text()
+    print("    选中即填 / 起始路径带原名 / csv 按内容写 / 取消不改动 → OK")
+    target.unlink()
     for _n, _v in saved.items():
         getattr(win, _n).setText(_v)
 

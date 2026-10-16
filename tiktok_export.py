@@ -527,7 +527,29 @@ def parse_export(path: Path | str) -> tuple[list[str], list[list[Any]]]:
 
 def write_rows(header: Iterable[str], rows: Iterable[Iterable[Any]],
                out_path: Path | str, sheet: str = "订单") -> Path:
-    """把解析出来的行写成干净的 xlsx（无说明行）。"""
+    """把解析出来的行写成干净的表（无说明行）。
+
+    **后缀决定格式**（③④⑤⑥ 的输出框都允许用户自己改后缀）：
+    ``.csv`` → 逗号分隔文本；其余（``.xlsx`` / ``.xlsm`` / 没后缀）→ xlsx。
+
+    csv 用 ``utf-8-sig`` 编码：不带 BOM 的话 Excel 双击打开中文全是乱码，
+    而这份文件多半就是给人双击看的。
+    """
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    def _cell(v: Any) -> Any:
+        return "" if v is None else v
+
+    if p.suffix.lower() == ".csv":
+        import csv
+        with p.open("w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow([_cell(c) for c in header])
+            for row in rows:
+                w.writerow([_cell(c) for c in row])
+        return p
+
     import openpyxl
 
     wb = openpyxl.Workbook()
@@ -536,8 +558,6 @@ def write_rows(header: Iterable[str], rows: Iterable[Iterable[Any]],
     ws.append(list(header))
     for row in rows:
         ws.append(list(row))
-    p = Path(out_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
     wb.save(p)
     return p
 
