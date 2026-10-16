@@ -28,8 +28,6 @@ import ast
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
-
 
 def _say(msg: str) -> None:
     """打一行进度日志；打不出来就咽掉，绝不让它影响构建。
@@ -136,24 +134,18 @@ hiddenimports = [
     "openpyxl",
     "openpyxl.styles",
     "openpyxl.utils",
-    # ★ 验证码自动处理（captcha_solver）★ numpy/cv2/ddddocr 都是函数内延迟
-    # import，PyInstaller 的静态分析看不见；不显式喂就等运行到「弹验证码」那步
-    # 才炸 ModuleNotFoundError。ddddocr 自带 onnx 模型文件，还要 collect_data_files。
-    "numpy",
-    "cv2",
-    "PIL",
-    "ddddocr",
-    "onnxruntime",
 ]
 
 excludes = [
     # 用不到，而且目标机器上根本没装：不排除的话 PyInstaller 只会刷警告
     "DrissionPage",
     "selenium",
-    # 体积大户，本项目零依赖（★ numpy/PIL 已因验证码求解移入 hiddenimports）
+    # 体积大户，本项目零依赖
+    "numpy",
     "pandas",
     "matplotlib",
     "scipy",
+    "PIL",
     "IPython",
     "jupyter",
     "notebook",
@@ -165,17 +157,11 @@ excludes = [
     "lib2to3",
 ]
 
-# ddddocr 的 onnx 模型是包内数据文件，静态分析拿不到，必须显式收集
-_datas = [
-    *collect_data_files("ddddocr"),
-    *collect_data_files("onnxruntime", include_py_files=False),
-]
-
 a = Analysis(
     [str(ROOT / ENTRY)],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=_datas,
+    datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

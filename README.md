@@ -321,11 +321,7 @@ python devtools/capture_order_request.py --store 2 --probe-get 订单.xlsx
      右上角切换器只保留**只读**读取（把店铺名写进日志，读不到不影响流程）
 3. **选中店铺 → 导出订单**：打开订单页 → 点「导出」按钮 → 等生成 → 拦截 URL 取回文件，
    写 `<店铺名>_订单.xlsx`（列名 = 导出文件表头，全量保留），原始文件另存 `_导出原始.xlsx`
-4. **抓客户信息**：从订单 Excel 读 `Order ID` 列，逐条 `order/get`，写 `<店铺名>_客户.xlsx`（18 列，含取自响应 `sku_module` 的「SKU ID」）。
-   **自动过验证码（两个时机，缺一不可）**：真机连跑约 20 单会弹「请完成下列验证后继续」拼图滑块。
-   验证码是**请求发出去之后**才由服务端弹的，而且会把这条请求 **hold 住**（实测新请求 15s+ 不返回）——
-   所以闸门既在**每单发请求之前**跑一次，也在**请求等响应期间**盯着（超过 2s 没回就当是它，过掉后
-   把计时重来一轮，被挂起的请求自己就会返回）。取图、识别缺口、拖滑块都在 `captcha_solver.py`（最多 3 把）
+4. **抓客户信息**：从订单 Excel 读 `Order ID` 列，逐条 `order/get`，写 `<店铺名>_客户.xlsx`（18 列，含取自响应 `sku_module` 的「SKU ID」）
 5. **导出商品评分**：⑤ 区「导出商品评分」按钮，走 `/product/rating` 页自己的「导出」
    按钮；导出后**只留 1~3 星**并覆盖保存（完整版留 `_评分原始.xlsx`）。
    **只导评分、先不抓客户**就点这一颗
@@ -391,9 +387,7 @@ python devtools/capture_order_request.py --store 2 --probe-get 订单.xlsx
 | ⑤ 日志停在「点击后 20s 内没有浏览器下载请求」 | **正常**：评分导出是异步任务，本来就不发下载请求（2026-10-15 真机抓包确认） | 接着看下一行「读 export/job 的 file_url」。若一直 `status=2` 说明服务端还在生成，加大「导出超时」（默认 300s）即可 |
 | ⑤ 报「页面内 fetch 失败：TypeError: Failed to fetch」 | `file_url` 在**另一个域名**（`seller-us.tiktok.com`），从店铺页取它是跨域 → CORS（`no-cors` 也读不了 body） | 已自动处理：先把文档导航到同域的静态文件当壳子再取（日志会写「文档同源就位」）。若报「没法把页面换到 … 下」＝那个域下的静态文件都打不开，用 `python devtools/live_rating_probe.py --api` 看真实响应 |
 | ⑥ 日志说「评分文件自带订单号列…」 | **正常且最好**：真机 CSV 自带 `order_id`，⑥ 直接用它，**不需要订单表** | 这行只是告诉你走的是最省事那条路；没有它才会退回昵称反查（需要订单表） |
-| ④/⑥ 抓到一半日志出现「⚠ 页面上出现了验证码」 | 连续请求触发风控，后台弹「请完成下列验证后继续」拼图滑块；不处理的话后续 `order/get` 会被拦 | **自动处理**：取图 → cv2 定位缺口 → 拖动滑块（最多 3 把），日志会写「✅ 已通过」。失败时可手动在浏览器里拖一次再点「停止」后重跑（已抓的会复用缓存/续写）；单独排查用 `python devtools/live_captcha_solve.py`（干跑）或加 `--go` 真拖 |
-| 日志出现「[验证码] 已开启「请求等待期间自动处理」」/「已处理，继续等这条被挂起的请求」 | **正常**：验证码是请求**发出后**才弹的，并且会把那条请求挂住不放 | 这是新增的「等响应期间过验证码」在干活。过掉之后被挂起的请求会自己返回，**不用重试**（日志里会看到那单紧接着成功）。若最终仍报「页面请求 60s 没返回（被验证码挂起了？）」，说明这轮没拖过——手动在浏览器里拖一次再重跑即可 |
-| 某一单日志卡住不动、界面转圈但 CPU 不高 | 老版本会在这里**永久死等**（验证码把请求挂住 + `awaitPromise` 死等 + 事件消息无限续命）。2026-10-15 已修：`call()` 的 `timeout` 改成**总时限**，到点抛 `ZiniaoTimeout`；API 层拿到超时**不再原层重试**（否则墙没拆、只是把 60s 变 3×60s） | 升级到新版本即可。想自查：`grep "页面请求" 运行日志.txt` |
+| 某一单日志停住不动（界面转圈但 CPU 不高），几十秒后报「等响应超过 60s」 | 服务端把那条请求**挂住了**（连续请求触发风控时会出现）；老版本还会在这里**永久死等** —— `awaitPromise` 死等 + CDP 的 `recv` 被源源不断的事件消息无限续命 | 2026-10-15 已修：`call()` 的 `timeout` 是**总时限**（到点抛 `ZiniaoTimeout`），单次请求 60s 上限；API 层拿到超时**不再原层重试**（否则只是把 60s 变 3×60s）。这一单会被记成失败、继续下一条，整批不会卡死。对策：等一会儿再重跑，或降低抓取速度（分批跑） |
 | ⑥ 报「既没订单号列、也没认出买家昵称列」 | 评分文件列名变了 | 把真实列名加进 `tiktok_export.RATING_ORDER_COLUMNS`（首选）或 `RATING_BUYER_COLUMNS`；日志里会打印前 10 个列名 |
 | 日志报「认不出后台店铺 X」 | 「后台店铺」框里填的名字不在内置市场表里 | 填显示名（`United States`）、区域码（`US`）或直接贴后台 URL（`…?shop_region=US`）。认不出时**不会**乱导航，继续用当前页面 |
 | 日志报「导航到 X 后落在 <URL>（想要 shop_region=XX）」 | 导航过去了但页面把请求重定向到了**别的区域站**（真机见过「开 eu 落在 us」），或店铺不在这家账号下 | 看日志里回填的**实际落地 URL**：如果那家店才是你要的，就把「后台店铺」填成它；这条只影响本次，后面身份核对与区域站扫描还有兜底 |
@@ -412,13 +406,8 @@ tiktok_export.py        ★「导出订单」「商品评分」按钮自动化�
                         RatingExporter = 评分页那颗导出按钮（★真机是异步任务：读 export/job 的 file_url，
                         跨域 → 借同域 robots.txt 当壳子取字节；CSV 解析）
 ziniao_bridge.py        紫鸟桥接：BrowserSession（原生 CDP + 断线自愈 + Fetch 拦截 + 页面内取字节）
-                        ★ `call()` 的 timeout 是**总时限**（事件消息不能无限续命）
-                        ★ BrowserTransport 支持 `wait_hook`：挂上后请求改「不 await + 轮询页面变量
-                          window.__tk_async_call」，等超 2s 就回调一次（给验证码用；不挂则完全走老路）
-captcha_solver.py       验证码自动处理：检测（.captcha_verify_container）→ 页面内 fetch 取图
-                        → cv2 暗色剪影定位缺口（跨阈值收候选、最暗者胜、y 带约束；ddddocr 兜底）
-                        → Input.dispatchMouseEvent 拟人拖动（先拖 24px 现场校准按钮↔拼图比值）
-                        → 轮询容器消失=通过。真机 2026-10-15 验证通过（verifyV2 code=200）
+                        ★ `call()` 的 timeout 是**总时限**（事件消息不能无限续命，到点抛 ZiniaoTimeout）
+                        ★ BrowserTransport 单次页面请求 60s 上限（wait_timeout）
 tiktok_client.py        ④ 的 order/get 客户端：参数 / 解析 / Excel 读写
 detail.py / list.py     原始抓包脚本（仅留档，接口直连思路已废弃）
 devtools/export_check.py 真机端到端验证脚本
@@ -428,23 +417,17 @@ devtools/captured_order_request.json 抓包模板（④ 会自动照抄它）
 devtools/live_rating_probe.py 真机探测：评分页点了「导出」之后浏览器到底发了什么
                         （默认只读；`--api` 留接口响应体；`--app` 端到端跑一遍导出）
 devtools/live_bad_probe.py 真机验证：评分 CSV 的 order_id → order/get → 客户
-devtools/live_captcha_probe.py 真机探测：验证码弹层长什么样（容器/背景图/拼图块/滑块按钮
-                        的选择器与坐标；默认只读）
-devtools/live_captcha_solve.py 真机驱动验证码求解：默认干跑（取图+算距离落盘
-                        _captcha_dump/，不动页面）；`--go` 真拖；`--go --watch 60` 盯着自动解
 devtools/check_bad_guard.py ⑥ 前置守卫的一次性验证（用**真实文件**跑：只有评分表、
                         没有订单表时不弹窗；老版「仅昵称」文件才拦。不联网）
 devtools/smoke_gui.py   离屏冒烟测试（14 段：构建/布局/「浏览…」换目录/流水线/换来源/换写法/商品评分/⑥单独跑/店铺导航/评分真机形状…）
                         ★ 必须桩掉紫鸟 IP 检测：假会话里那个「检测成功」按钮永远不出现，
                           真跑 check_ip 会**每段白等 30s 超时**（14 段 ≈ 十几分钟，看着像卡死）
 devtools/test_rating_export.py 商品评分导出回归测试（假 CDP 会话，52 条断言）
-devtools/test_transport.py 「页面来源 × 写法」择路 + 验证码打断 + 超时总时限回归测试
-                        （60 条断言；第 10 组专打「请求等响应期间过验证码」，第 11 组验事件不续命）
+devtools/test_transport.py 「页面来源 × 写法」择路 + 超时处置回归测试
+                        （51 条断言；第 10 组「超时不在原层重试」，第 11 组「事件不续命」）
 devtools/test_customer_sku.py 客户表「SKU ID」列回归测试（30 条断言：响应用 sku_id / 不拿 Seller SKU 顶 / 订单表兜底）
 devtools/test_bad_review.py 差评链路回归测试（75 条断言：1~3 星筛选 / 别名列名 / order_id 直连 / 昵称反查兜底 / ⑥单独跑）
 devtools/test_shop_switch.py 后台店铺回归测试（43 条断言：显示名/区域码/URL→后台 URL 解析、已是目标幂等、落错站回填实际 URL、导航失败不中断）
-devtools/test_captcha.py 验证码求解回归测试（25 条断言：**程序合成**验证码图测缺口识别、
-                        显示/原图坐标换算、拟人轨迹、假浏览器走通 solve 全链路与重试）
 devtools/live_shop_probe.py  真机探测脚本（连已开的店铺浏览器：现在在哪家店 + 目标会导航到哪个 URL；默认只读，--go 才真跳）
 devtools/test_windows_paths.py Windows 客户端定位回归测试（假文件系统，任何平台可跑）
 devtools/make_release.py 组装发布目录（exe + 旁挂紫鸟项目），可 --zip

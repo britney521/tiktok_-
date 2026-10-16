@@ -69,7 +69,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-import captcha_solver as cs
 import tiktok_client as tc
 import tiktok_export as te
 import ziniao_bridge as zb
@@ -960,60 +959,6 @@ class PipelineThread(QThread):
                           "（区域站会互相重定向，抓客户按落地站发）")
         return landed
 
-    def _captcha_guard(self, browser: Any, throttle: float = 0.0) -> bool:
-        """验证码闸门：没有验证码 → 直接返回 False（一次轻量 eval）；有 → 自动
-        「取图 → 算缺口 → 拖滑块」，最多试 3 把。任何异常都不打断抓取。
-
-        ★ 它有两个调用时机，缺一不可 ★
-        1. **每单发请求之前** —— 上一次留下的验证码（还没消失）先过掉；
-        2. **请求等响应的期间**（``BrowserTransport.wait_hook``）—— 验证码其实
-           是**请求发出去之后**才弹的，而且会把这条请求 hold 住。等超过 2s 还没
-           回来就说明多半是它，这时过掉验证码，被挂起的请求才有机会返回。
-
-        ``throttle``：大于 0 时，距上次**实际检测**不足这么多秒就直接返回
-        （等响应期间每 0.35s 会调一次，不能每次都真查）。返回 True 表示
-        「这一下刚处理过验证码」，调用方可以据此重试/重新计时。
-        """
-        if browser is None:
-            return False
-        now = time.monotonic()
-        if throttle and now - getattr(self, "_captcha_at", 0.0) < throttle:
-            return False
-        self._captcha_at = now
-        try:
-            if cs.detect(browser) is None:
-                return False
-        except Exception:
-            return False
-        self.log.emit("⚠ 页面上出现了验证码，开始自动处理…")
-        try:
-            r = cs.solve(browser, log=lambda m: self.log.emit(str(m)),
-                         dump_dir=BASE_DIR / "_captcha_dump")
-        except Exception as exc:
-            self.log.emit(f"[验证码] 处理异常：{type(exc).__name__}: {exc}")
-            return False
-        if r.get("ok"):
-            if r.get("skipped"):
-                self.log.emit("[验证码] 处理时验证码已消失，继续抓取")
-            else:
-                self.log.emit(f"[验证码] ✅ 已通过（{r.get('attempts')} 次尝试），继续抓取")
-            return True
-        self.log.emit(f"[验证码] ✖ 没通过：{r.get('error')}"
-                      "—— 后续请求可能失败；也可以手动在浏览器里完成验证后点继续")
-        return False
-
-    def _attach_captcha_hook(self, browser: Any, client_obj: Any) -> None:
-        """把「等响应期间过验证码」挂到浏览器传输层上（见 ``_captcha_guard`` 第 2 条）。
-
-        只有在传输层是 ``BrowserTransport``（页面内 fetch）时才有意义 —— 本地直连
-        通道不会弹验证码。挂不上就算了，不影响抓取。
-        """
-        tp = getattr(client_obj, "transport", None)
-        if tp is None or not hasattr(tp, "wait_hook"):
-            return
-        tp.wait_hook = lambda: self._captcha_guard(browser, throttle=2.0)
-        self.log.emit("[验证码] 已开启「请求等待期间自动处理」（验证码不会再把请求挂死）")
-
     def _fetch_customers(self, browser: Any, client_obj: tc.OrderClient,
                          rows: list[dict[str, str]],
                          origins: list[str] | None = None) -> dict[str, Any]:
@@ -1040,10 +985,6 @@ class PipelineThread(QThread):
         # 停在首页/工作台，一样是 98001008「需要权限」。③ 导出本来就在订单页上，
         # 但下载与面板操作都可能把页面带偏，所以这里显式回一次。
         self._ensure_order_page(browser)
-        self._captcha_guard(browser)        # 页面停好后先看一眼有没有验证码
-        # 验证码多一半是**请求发出去之后**才弹的，且会把该请求挂住 → 等响应期间
-        # 也要能过验证码，否则那一单会一直等到超时（看着像卡死）。
-        self._attach_captcha_hook(browser, client_obj)
 
         # ---- 店铺身份预检：先拿前 3 条试水，别等跑完几百条才发现全错 ----
         try:
@@ -1114,7 +1055,6 @@ class PipelineThread(QThread):
                 self.customer_row.emit(i, row)
                 self.customer_progress.emit(i + 1, len(ids))
                 continue
-            self._captcha_guard(browser)    # ★ 每单之前：有验证码先自动过掉
             try:
                 payload = client_obj.fetch([oid], chunk_size=1)
                 orders = ((payload.get("data") or {}).get("main_order")) or []
@@ -1131,22 +1071,6 @@ class PipelineThread(QThread):
                 row = tc.blank_customer(oid, "API_ERROR", sku_map.get(oid, ""))
                 fail += 1
                 self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 失败：{exc}")
-                # ★ 页面请求超时 = 多半是验证码把这一单挂住了：过掉验证码再试一次 ★
-                if str(exc.code) == "timeout" and browser is not None:
-                    if self._captcha_guard(browser, throttle=0.5):
-                        try:
-                            payload = client_obj.fetch([oid], chunk_size=1)
-                            orders = ((payload.get("data") or {}).get("main_order")) or []
-                            if orders:
-                                row = tc.parse_customer(orders[0], sku_map.get(oid, ""))
-                                ok += 1
-                                fail -= 1
-                                self.log.emit(f"[{i + 1}/{len(ids)}] {oid} → 过验证码后重试成功："
-                                              f"{row.get('Buyer Nickname', '')} "
-                                              f"{row.get('Recipient', '')}")
-                        except Exception as exc2:
-                            self.log.emit(f"   过验证码后重试仍失败："
-                                          f"{type(exc2).__name__}: {exc2}")
                 if exc.is_fatal and not fatal:
                     # 保险：预检通过了但首条就撞凭据错误 —— 通道在这一路上还会
                     # 再扫一遍区域站并锁定可用组合，所以复检一次再决定中止与否。
@@ -1378,7 +1302,6 @@ class PipelineThread(QThread):
         # ★ 抓客户前必须把页面停回**订单页**（和④同一个前提：站对、页不对照样
         #   98001008）。⑤ 结束时页面还在 /product/rating 上。
         self._ensure_order_page(browser)
-        self._attach_captcha_hook(browser, client_obj)   # 同④：等响应期间也要能过验证码
 
         # 单独跑⑥时④没跑过，缓存是空的 —— 这里自己按订单表补一份
         if not self._sku_map_cache and order_rows is not None:
@@ -1407,7 +1330,6 @@ class PipelineThread(QThread):
                 ok += 1
                 self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 复用④的结果")
             else:
-                self._captcha_guard(browser)    # ★ 真要发请求前：有验证码先自动过掉
                 try:
                     payload = client_obj.fetch([oid], chunk_size=1)
                     orders = ((payload.get("data") or {}).get("main_order")) or []
@@ -1430,26 +1352,6 @@ class PipelineThread(QThread):
                         extra))
                     fail += 1
                     self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → 失败：{exc}")
-                    # ★ 超时 = 多半被验证码挂住了：过掉验证码再试一次 ★
-                    if str(exc.code) == "timeout" and browser is not None:
-                        if self._captcha_guard(browser, throttle=0.5):
-                            try:
-                                payload = client_obj.fetch([oid], chunk_size=1)
-                                orders = ((payload.get("data") or {})
-                                          .get("main_order")) or []
-                                if orders:
-                                    results[-1] = self._bad_row(
-                                        tc.parse_customer(orders[0],
-                                                          sku_map.get(oid, "")), extra)
-                                    ok += 1
-                                    fail -= 1
-                                    self._cust_cache[oid] = dict(results[-1])
-                                    self.log.emit(f"[{i + 1}/{len(pairs)}] {oid} → "
-                                                  f"过验证码后重试成功："
-                                                  f"{results[-1].get('Buyer Nickname', '')}")
-                            except Exception as exc2:
-                                self.log.emit(f"   过验证码后重试仍失败："
-                                              f"{type(exc2).__name__}: {exc2}")
                     if exc.is_fatal and not fatal:
                         fatal = True
                         self.log.emit("—" * 58)

@@ -291,15 +291,6 @@ def main() -> int:
         _flush_bad_customers = staticmethod(PipelineThread._flush_bad_customers)
         _order_id = staticmethod(PipelineThread._order_id)
 
-        def _captcha_guard(self, browser, throttle: float = 0.0) -> bool:
-            """离线桩：假会话里没有验证码（真实现第一步 detect 就返回 None）。"""
-            self.captcha_checks = getattr(self, "captcha_checks", 0) + 1
-            return False
-
-        def _attach_captcha_hook(self, browser, client_obj) -> None:
-            """离线桩：这里没有真传输层可挂（真实现只看 client.transport）。"""
-            self.captcha_hooked = getattr(self, "captcha_hooked", 0) + 1
-
         def __init__(self, opts: dict) -> None:
             super().__init__(opts)
             self.stop_event = types.SimpleNamespace(is_set=lambda: False)

@@ -144,11 +144,13 @@ class ZiniaoBridgeError(RuntimeError):
     """桥接层自身的错误（找不到项目、连不上浏览器等）。"""
 
 
-class ZiniaoTimeout(ZiniaoBridgeError):
-    """页面请求等超时了 —— 典型是被验证码 hold 住（请求发出后才弹的那种）。
+class ZiniaoTimeout(ZiniaoBridgeError, TimeoutError):
+    """页面请求等响应等超时了（后面那串事件消息一直续命，业务响应就是不来）。
 
-    单独分一类，是因为它**不该在原层重试**：墙就立在那里，重试还是同样的结果。
-    交给上层「先过验证码再重试这一单」才有意义。
+    单独分一类，是因为它**不该在原层重试**：该请求多半已经被服务端挂住了，
+    重试只是把「等 60s」变成「等 3×60s」。交给上层记一行失败、继续下一条。
+
+    同时继承 ``TimeoutError``，是为了照旧能被 ``except TimeoutError`` 接住。
     """
 
 
@@ -714,8 +716,8 @@ class BrowserSession:
         ★ ``timeout`` 是**总时限**，不是「单次 recv 的等待」★
         2026-10-15 真机定案：这条连接在等响应期间会不停推事件（``Network.*`` /
         ``Fetch.*`` …）。旧写法每收到一条事件就重新 ``recv`` 一次，「单次超时」
-        被无限续命 —— 一旦页面里有请求被验证码 hold 住（实测：验证码挂着时新发
-        的 ``order/get`` 14s+ 不返回），这里就**永远不返回**：流水线看着像卡死、
+        被无限续命 —— 一旦页面里有请求被服务端挂住（实测：挂着时新发的
+        ``order/get`` 14s+ 不返回），这里就**永远不返回**：流水线看着像卡死、
         日志停止增长、CPU 却在空转。现在按墙上时钟判定，到点必抛。
         """
         ws = self._ws
@@ -732,7 +734,7 @@ class BrowserSession:
                 if deadline is not None:
                     left = deadline - time.time()
                     if left <= 0:
-                        raise TimeoutError(
+                        raise ZiniaoTimeout(
                             f"{method} 等响应超过 {timeout}s（期间只收到事件消息）")
                     ws.settimeout(max(0.2, left))
                 msg = json.loads(ws.recv())
@@ -745,7 +747,7 @@ class BrowserSession:
             # （否则「重连 → 再等满一轮 → 再重连」把 120s 变成几分钟）
             if deadline is not None and time.time() >= deadline - 0.05 \
                     and _is_ws_error(exc):
-                raise TimeoutError(
+                raise ZiniaoTimeout(
                     f"{method} 等响应超过 {timeout}s（期间只收到事件消息）") from exc
             if isinstance(exc, TimeoutError):
                 raise
@@ -1469,13 +1471,8 @@ class BrowserTransport:
         self._first_logged = ""
         # 这些码说明「这次请求发得不对」—— 换写法再试（页面来源换过了就换 host）
         self.retry_codes = {str(c) for c in blocked_codes} | PERMISSION_CODES
-        # ★ 等响应期间的验证码闸门（可选）★
-        # 验证码是**请求发出去之后**才弹的，还会把这条请求一直 hold 住。挂上
-        # ``wait_hook`` 后，等待期间每隔一会儿调它一次（返回 True = 刚处理完验证码，
-        # 计时重来一轮）。不挂 = 老行为（一次 awaitPromise 死等）。
-        self.wait_hook: Any = None
         # 单次请求的**总时限**（秒）。正常 order/get 是 1~2s，60s 已经非常宽松；
-        # 到点就报错交给上层重试，好过被验证码挂到天荒地老。
+        # 到点就抛 ZiniaoTimeout 交给上层记失败，好过无限等下去。
         self.wait_timeout: float = 60.0
 
     @property
@@ -1688,78 +1685,12 @@ class BrowserTransport:
             "})()"
         )
 
-    # 等响应用：结果先写进页面上这个变量，Python 侧再轮询取回
-    WAIT_SLOT = "__tk_async_call"
-
-    def _eval(self, script: str, timeout: float = 20.0) -> Any:
-        """只读地跑一段 JS（不 await Promise）。"""
-        fn = getattr(self._browser, "eval", None)
-        if callable(fn):
-            return fn(script, await_promise=False, timeout=timeout)
-        return self.tab.run_js(script, as_expr=True, timeout=timeout)
-
     def _run(self, script: str) -> Any:
-        if self.wait_hook is None:          # 没挂闸门 → 老路（一次 awaitPromise）
-            runner = getattr(self._browser, "run_js", None)
-            if callable(runner):
-                return runner(script, timeout=self.wait_timeout)
-            return self.tab.run_js(script, as_expr=True, timeout=self.wait_timeout)
-        return self._run_watchful(script)
-
-    def _run_watchful(self, script: str) -> Any:
-        """发请求但**不在 CDP 里死等**，改成「页面立刻返回 + Python 轮询结果」。
-
-        ★ 为什么必须这样（2026-10-15 真机）★
-        验证码是**请求发出去之后**由服务端触发的，而且会把这条请求一直 hold 住
-        （实测：验证码挂着时新发的 ``order/get`` 14s+ 不返回）。用 ``awaitPromise``
-        死等 = 整个抓取卡在那一单上，验证码也永远不会被处理（闸门在请求**之前**
-        跑，那时还没验证码）。
-        现在把结果写进 ``window[WAIT_SLOT]``、页面立刻返回，Python 侧每 0.35s 看
-        一眼状态；**等超过 2s 还没回就顺手过一次验证码**（``wait_hook``），过了
-        就把计时重来一轮，让被放行的请求有机会返回。
-        """
-        slot = self.WAIT_SLOT
-        armed = (
-            "(() => {"
-            f"window.{slot} = {{state:'pending', t:Date.now()}};"
-            "(async () => {"
-            "  try {"
-            f"    const v = await ({script});"
-            f"    window.{slot} = {{state:'done', value:v,"
-            f"                    ms:Date.now()-window.{slot}.t}};"
-            "  } catch (e) {"
-            f"    window.{slot} = {{state:'error', error:String(e),"
-            f"                    ms:Date.now()-window.{slot}.t}};"
-            "  }"
-            "})();"
-            "return 'armed';"
-            "})()"
-        )
-        self._eval(armed)
-        started = time.time()
-        deadline = started + float(self.wait_timeout)
-        while True:
-            if time.time() > deadline:
-                raise ZiniaoTimeout(
-                    f"页面请求 {self.wait_timeout:.0f}s 没返回"
-                    "（被验证码挂起了？）")
-            time.sleep(0.35)
-            # pending 时只读状态（别把几万字节的响应体每次拉回来）
-            state = str(self._eval(
-                f"(window.{slot} && window.{slot}.state) || ''") or "")
-            if state == "done":
-                return self._eval(f"String(window.{slot}.value)", timeout=60)
-            if state == "error":
-                err = str(self._eval(f"String((window.{slot}||{{}}).error)") or "")
-                raise ZiniaoBridgeError(f"页面 fetch 异常：{err}")
-            # 正常请求 1~2s 就回来了；超过 2s 还没回，多半是验证码在拦 —— 过掉它
-            if self.wait_hook and time.time() - started > 2.0:
-                try:
-                    if self.wait_hook():
-                        self.log("[验证码] 已处理，继续等这条被挂起的请求")
-                        deadline = time.time() + float(self.wait_timeout)
-                except Exception:
-                    pass
+        """在页面里跑一段 JS 并等结果（``timeout`` 是**总时限**，到点抛错）。"""
+        runner = getattr(self._browser, "run_js", None)
+        if callable(runner):
+            return runner(script, timeout=self.wait_timeout)
+        return self.tab.run_js(script, as_expr=True, timeout=self.wait_timeout)
 
     # -- 单次请求 -----------------------------------------------------------
     def _once(self, full: str, body: dict[str, Any] | None) -> dict[str, Any]:

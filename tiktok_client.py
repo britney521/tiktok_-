@@ -382,9 +382,10 @@ class OrderClient:
                 raise
             except Exception as exc:  # 网络 / 解析异常 → 重试
                 last_exc = exc
-                # ★ 页面请求超时（多一半是验证码把请求挂住了）**不在这里重试** ★
-                # 墙没拆掉，重试只是把 60s 变成 3×60s。交给上层「先过验证码、
-                # 再重试这一单」。按类名判断，免得为这一个判断反向依赖桥接层。
+                # ★ 页面请求等超时了**不在这里重试** ★
+                # 那条请求多半已经被服务端挂住，重试只是把 60s 变成 3×60s。
+                # 交给上层记一行失败、继续下一条。按类名判断，免得为这一个
+                # 判断反向依赖桥接层。
                 if type(exc).__name__ == "ZiniaoTimeout":
                     raise ApiError("timeout", str(exc)) from exc
                 if attempt < self.retries:
